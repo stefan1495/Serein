@@ -34,12 +34,42 @@ pub struct VoiceRosterRow<'a> {
 	pub entry: &'a RosterEntry,
 	/// Display name when the member is loaded.
 	pub name: Option<&'a str>,
+	#[cfg(target_os = "linux")]
+	user: Option<&'a model::User>,
 	/// Mute and deafen flags as shown, including the own call's live state.
 	pub shown: Participant,
 	pub speaking: bool,
 }
 
 impl MessagingUi {
+	#[cfg(target_os = "linux")]
+	pub(super) fn voice_overlay_settings(&mut self, ui: &mut egui::Ui) {
+		ui.heading(self.language.text("voice-overlay-heading"));
+		ui.label(self.language.text("voice-overlay-description"));
+		let off = self.language.text("voice-overlay-off");
+		let selected = self
+			.voice_overlay_monitor
+			.as_ref()
+			.map_or(off.as_str(), |name| {
+				self.voice_overlay_monitors
+					.iter()
+					.find(|(id, _)| id == name)
+					.map_or(name, |(_, label)| label)
+			});
+		egui::ComboBox::from_id_salt("speaker-overlay-monitor")
+			.selected_text(selected)
+			.show_ui(ui, |ui| {
+				ui.selectable_value(&mut self.voice_overlay_monitor, None, off);
+				for (name, label) in &self.voice_overlay_monitors {
+					ui.selectable_value(&mut self.voice_overlay_monitor, Some(name.clone()), label);
+				}
+			});
+		if self.voice_overlay_monitors.is_empty() {
+			ui.label(self.language.text("voice-overlay-unavailable"));
+		}
+		ui.separator();
+	}
+
 	pub(super) fn exit_voice_fullscreen(&mut self) {
 		if let Some((_, ctx, previous, focus)) = self.voice_fullscreen.take() {
 			self.voice_fullscreen_request = Some(previous);
@@ -406,6 +436,16 @@ impl MessagingUi {
 		channel: Id,
 		participant: &Participant,
 	) -> bool {
+		self.is_speaking_in(state, channel, participant, &self.voice_speaking)
+	}
+
+	fn is_speaking_in(
+		&self,
+		state: &State,
+		channel: Id,
+		participant: &Participant,
+		speakers: &[Id],
+	) -> bool {
 		!inactive_recipient(state, channel, participant.user)
 			&& !self.voice_user_locally_muted(participant.user)
 			&& !participant.muted
@@ -417,7 +457,7 @@ impl MessagingUi {
 					&& matches!(call.phase, Phase::Connected | Phase::Waiting)
 					&& !call.deafened
 					&& !call.server_deafened
-			}) && self.voice_speaking.contains(&participant.user)
+			}) && speakers.contains(&participant.user)
 	}
 
 	/// Everyone in a voice channel the account can view, as the client shows them: the
@@ -436,15 +476,20 @@ impl MessagingUi {
 		let ordered = rows
 			.iter()
 			.filter(move |entry| Some(entry.channel) == call)
-			.chain(rows.iter().filter(move |entry| Some(entry.channel) != call));
-		// Snapshots and the change key walk every row each frame, so rows needing the
-		// member fallback share one index of the loaded list. It is built on first use:
-		// rows filtered out or already carrying their member never pay for it.
+			.chain(rows.iter().filter(move |entry| Some(entry.channel) != call))
+			.filter(|entry| state.can_view(entry.channel));
+		self.voice_roster_rows(state, ordered, &self.voice_speaking)
+	}
+
+	fn voice_roster_rows<'a>(
+		&'a self,
+		state: &'a State,
+		rows: impl Iterator<Item = &'a RosterEntry> + 'a,
+		speakers: &'a [Id],
+	) -> impl Iterator<Item = VoiceRosterRow<'a>> + 'a {
+		// Share one lazily built member index across the visible rows.
 		let mut index = None;
-		ordered.filter_map(move |entry| {
-			if !state.can_view(entry.channel) {
-				return None;
-			}
+		rows.map(move |entry| {
 			let shown = shown_participant(state, entry);
 			let member = entry.member.as_ref().or_else(|| {
 				index
@@ -452,13 +497,61 @@ impl MessagingUi {
 					.get(entry.guild, entry.participant.user)
 			});
 			let (user, name) = resolve_member_with(state, member, entry);
-			Some(VoiceRosterRow {
+			VoiceRosterRow {
 				entry,
 				name: user.map(|_| name),
-				speaking: self.is_speaking(state, entry.channel, &shown),
+				#[cfg(target_os = "linux")]
+				user,
+				speaking: self.is_speaking_in(state, entry.channel, &shown, speakers),
 				shown,
-			})
+			}
 		})
+	}
+
+	/// Actual members of the visible active call. Private calls have no guild roster;
+	/// use call participants rather than showing all recipients or people still ringing.
+	#[cfg(target_os = "linux")]
+	pub fn active_voice_speakers<'a>(
+		&'a self,
+		state: &'a State,
+		speakers: &'a [Id],
+	) -> impl Iterator<Item = (Id, &'a str, Option<&'a model::User>)> + 'a {
+		let call = state
+			.voice
+			.active
+			.as_ref()
+			.filter(|call| state.can_view(call.channel));
+		let guild = call
+			.filter(|call| call.guild.is_some())
+			.into_iter()
+			.flat_map(move |call| {
+				let rows = state
+					.voice
+					.roster
+					.iter()
+					.filter(|entry| entry.channel == call.channel);
+				self.voice_roster_rows(state, rows, speakers)
+					.filter(|row| row.speaking)
+					.map(|row| (row.shown.user, row.name.unwrap_or("Participant"), row.user))
+			});
+		let private = call
+			.filter(|call| call.guild.is_none())
+			.into_iter()
+			.flat_map(move |call| {
+				call.participants.iter().filter_map(move |participant| {
+					let shown = shown_call_participant(state, call.channel, *participant);
+					if !self.is_speaking_in(state, call.channel, &shown, speakers) {
+						return None;
+					}
+					let user = participant_user(state, call.channel, shown.user);
+					Some((
+						shown.user,
+						user.map_or("Participant", |user| user.name.as_str()),
+						user,
+					))
+				})
+			});
+		guild.chain(private)
 	}
 
 	pub(super) fn voice_channel_button(
@@ -5073,12 +5166,15 @@ fn stage_participants(state: &State, channel: Id) -> Vec<RosterEntry> {
 /// The local participant follows this device's toggles at once instead of waiting for the
 /// gateway echo, so a deafen shows the deafened glyph immediately (and in the offline preview).
 pub(super) fn shown_participant(state: &State, entry: &RosterEntry) -> Participant {
-	let mut participant = entry.participant;
+	shown_call_participant(state, entry.channel, entry.participant)
+}
+
+fn shown_call_participant(state: &State, channel: Id, mut participant: Participant) -> Participant {
 	if let Some(call) = state
 		.voice
 		.active
 		.as_ref()
-		.filter(|call| call.channel == entry.channel && call.phase != Phase::Failed)
+		.filter(|call| call.channel == channel && call.phase != Phase::Failed)
 		&& state
 			.user
 			.as_ref()

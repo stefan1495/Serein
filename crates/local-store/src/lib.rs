@@ -129,6 +129,7 @@ pub struct AppPreferences {
 	pub voice_deafened: bool,
 	pub voice_input: Option<String>,
 	pub voice_output: Option<String>,
+	pub voice_overlay_monitor: Option<String>,
 	pub input_percent: u16,
 	pub output_percent: u16,
 	/// Which GPU renders the window; applied on the next start.
@@ -193,6 +194,7 @@ impl Default for AppPreferences {
 			voice_deafened: false,
 			voice_input: None,
 			voice_output: None,
+			voice_overlay_monitor: None,
 			input_percent: 100,
 			output_percent: 100,
 			gpu_preference: Default::default(),
@@ -222,7 +224,9 @@ impl AppPreferences {
 						.all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 			}) && self.transparency <= 100
 			&& self.blur <= 100
-			&& self.input_percent <= 200
+			&& self.voice_overlay_monitor.as_ref().is_none_or(|name| {
+				!name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
+			}) && self.input_percent <= 200
 			&& self.output_percent <= 200
 			&& self
 				.voice_processing
@@ -2403,6 +2407,7 @@ mod tests {
 			voice_muted: true,
 			voice_deafened: true,
 			voice_input: Some("synthetic microphone".into()),
+			voice_overlay_monitor: Some("DP-2".into()),
 			output_percent: 75,
 			gpu_preference: model::GpuPreference::PowerSaving,
 			graphics_api: model::GraphicsApi::OpenGl,

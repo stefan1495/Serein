@@ -20,6 +20,8 @@ pub mod proxy_credentials;
 pub mod save;
 pub mod session;
 pub mod single_instance;
+#[cfg(target_os = "linux")]
+pub mod speaker_layer;
 pub mod startup;
 pub mod system_theme;
 pub mod tray;

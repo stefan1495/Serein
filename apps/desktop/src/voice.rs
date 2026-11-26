@@ -170,7 +170,7 @@ struct Live {
 	events: mpsc::Receiver<Notice>,
 	// Terminal errors must survive a full progress queue; retain the first safe reason.
 	failure: Arc<OnceLock<&'static str>>,
-	speakers: watch::Receiver<[u64; 64]>,
+	speakers: watch::Receiver<SpeakerSnapshot>,
 	latency: watch::Receiver<ui::VoiceLatency>,
 	task: JoinHandle<()>,
 	devices: Devices,
@@ -182,6 +182,60 @@ struct Live {
 	remote_video: Arc<std::sync::Mutex<RemotePictures>>,
 	/// Decoded audio of a watched stream, mixed into this call's playback.
 	stream_audio: mpsc::SyncSender<discord_voice::PlaybackFrame>,
+}
+
+struct SpeakerSnapshot {
+	users: [u64; 64],
+	#[cfg(target_os = "linux")]
+	overlay: OverlaySpeakerEpoch,
+}
+
+impl SpeakerSnapshot {
+	fn new() -> Self {
+		Self {
+			users: [0; 64],
+			#[cfg(target_os = "linux")]
+			overlay: OverlaySpeakerEpoch::default(),
+		}
+	}
+
+	fn replace(&mut self, users: [u64; 64]) {
+		self.users = users;
+		#[cfg(target_os = "linux")]
+		{
+			self.overlay.has_sample = self.overlay.ready;
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	fn overlay_sample(&self) -> Option<(u64, [u64; 64])> {
+		self.overlay.ready.then(|| {
+			let users = if self.overlay.has_sample {
+				self.users
+			} else {
+				[0; 64]
+			};
+			(self.overlay.epoch, users)
+		})
+	}
+}
+
+// Updated with the samples in the producer's watch, not via the separate UI notice queue.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct OverlaySpeakerEpoch {
+	epoch: u64,
+	ready: bool,
+	has_sample: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl OverlaySpeakerEpoch {
+	fn secure(&mut self) {
+		self.epoch = self.epoch.wrapping_add(1);
+		self.ready = false;
+		self.has_sample = false;
+	}
 }
 
 #[derive(Default)]
@@ -1017,6 +1071,46 @@ impl Voice {
 			),
 		}
 	}
+	#[cfg(target_os = "linux")]
+	pub(crate) fn overlay_source(
+		&self,
+		state: &State,
+	) -> Option<(crate::speaker_overlay::CallKey, [Id; 64])> {
+		let live = self.live.as_ref()?;
+		let call = state.voice.active.as_ref()?;
+		if !live.media_ready
+			|| live.negotiation.is_some()
+			|| live.failure.get().is_some()
+			|| live.task.is_finished()
+			|| !matches!(call.phase, Phase::Connected | Phase::Waiting)
+			|| !state.can_call(call.channel)
+			|| state.user.as_ref().is_none_or(|user| user.id != live.user)
+		{
+			return None;
+		}
+		let (media_epoch, users) = live.speakers.borrow().overlay_sample()?;
+		let key = current_overlay_source(
+			crate::speaker_overlay::CallKey {
+				generation: live.generation,
+				channel: live.channel,
+				request: live.request,
+				negotiation_revision: live.negotiation_revision,
+				media_epoch,
+			},
+			(state.generation, call.channel, call.request),
+			live.moved.is_some(),
+		)?;
+		let muted = live.controls.borrow().muted;
+		let speakers = users.map(|user| {
+			if muted && user == live.user.0 {
+				Id(0)
+			} else {
+				Id(user)
+			}
+		});
+		Some((key, speakers))
+	}
+
 	pub fn poll(
 		&mut self,
 		runtime: &Runtime,
@@ -1458,6 +1552,7 @@ impl Voice {
 			ui.voice_speaking.extend(
 				live.speakers
 					.borrow()
+					.users
 					.iter()
 					.copied()
 					.filter(|user| {
@@ -1944,7 +2039,7 @@ impl Voice {
 		let (send, events) = mpsc::sync_channel(8);
 		let failure = Arc::new(OnceLock::new());
 		let audio_failure = failure.clone();
-		let (speaking, speakers) = watch::channel([0; 64]);
+		let (speaking, speakers) = watch::channel(SpeakerSnapshot::new());
 		let (latency_send, latency) = watch::channel(ui::VoiceLatency::default());
 		let audio_send = send.clone();
 		let wake = ctx.clone();
@@ -2048,12 +2143,22 @@ impl Voice {
 						Status::CameraAvailable(available) => Notice::CameraAvailable(available),
 						Status::Connecting => Notice::Progress(Phase::ConnectingTransport),
 						Status::Discovering => Notice::Progress(Phase::Discovering),
-						Status::Securing => Notice::Progress(Phase::Securing),
-						Status::WaitingForPeer => Notice::WaitingForPeer,
+						Status::Securing => {
+							#[cfg(target_os = "linux")]
+							speaking.send_modify(|sample| sample.overlay.secure());
+							Notice::Progress(Phase::Securing)
+						}
+						Status::WaitingForPeer => {
+							#[cfg(target_os = "linux")]
+							speaking.send_modify(|sample| sample.overlay.ready = true);
+							Notice::WaitingForPeer
+						}
 						Status::Ready { privacy_code } => {
 							if privacy_code.len() > 256 {
 								return Err(());
 							}
+							#[cfg(target_os = "linux")]
+							speaking.send_modify(|sample| sample.overlay.ready = true);
 							Notice::MediaReady(privacy_code)
 						}
 						Status::RemoteAudio => Notice::RemoteAudio,
@@ -2067,7 +2172,7 @@ impl Voice {
 							return Ok(());
 						}
 						Status::Speaking(users) => {
-							speaking.send_replace(*users);
+							speaking.send_modify(|sample| sample.replace(*users));
 							status_wake.request_repaint();
 							return Ok(());
 						}
@@ -2118,6 +2223,17 @@ impl Voice {
 		Ok(())
 	}
 }
+#[cfg(target_os = "linux")]
+fn current_overlay_source(
+	source: crate::speaker_overlay::CallKey,
+	active: (u64, Id, u64),
+	moved: bool,
+) -> Option<crate::speaker_overlay::CallKey> {
+	// `live.channel` can change without restarting media. That worker's untagged
+	// speaker samples are never projected again, even if moved back to the same channel.
+	(!moved && (source.generation, source.channel, source.request) == active).then_some(source)
+}
+
 impl Drop for Voice {
 	fn drop(&mut self) {
 		self.stop();
@@ -2326,6 +2442,66 @@ pub fn takeover_notice(state: &State, event: &Event) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn overlay_rejects_old_speaker_source_on_in_place_move_until_fresh_media() {
+		let source = crate::speaker_overlay::CallKey {
+			generation: 4,
+			channel: Id(10),
+			request: 9,
+			negotiation_revision: 5,
+			media_epoch: 1,
+		};
+		assert_eq!(
+			current_overlay_source(source, (4, Id(10), 9), false),
+			Some(source)
+		);
+		let relabeled = crate::speaker_overlay::CallKey {
+			channel: Id(11),
+			..source
+		};
+		assert_eq!(
+			current_overlay_source(relabeled, (4, Id(11), 9), true),
+			None
+		);
+		assert_eq!(current_overlay_source(source, (4, Id(10), 9), true), None);
+		let fresh = crate::speaker_overlay::CallKey {
+			negotiation_revision: 6,
+			..relabeled
+		};
+		assert_eq!(
+			current_overlay_source(fresh, (4, Id(11), 9), false),
+			Some(fresh)
+		);
+		assert_eq!(current_overlay_source(fresh, (4, Id(11), 10), false), None);
+		assert_eq!(current_overlay_source(fresh, (5, Id(11), 9), false), None);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn overlay_resecuring_rejects_speech_until_a_ready_epoch_sample() {
+		let mut sample = SpeakerSnapshot::new();
+		let mut speakers = [0; 64];
+		speakers[0] = 42;
+		sample.overlay.ready = true;
+		sample.replace(speakers);
+		let (epoch, current) = sample.overlay_sample().unwrap();
+		assert_eq!(current[0], 42);
+
+		sample.overlay.secure();
+		assert!(sample.overlay_sample().is_none());
+		sample.replace(speakers); // An update before Ready must not reappear afterward.
+		sample.overlay.ready = true;
+		let (resumed_epoch, current) = sample.overlay_sample().unwrap();
+		assert_ne!(resumed_epoch, epoch);
+		assert_eq!(sample.users[0], 42); // Independent existing indicator unchanged.
+		assert!(!current.contains(&42));
+
+		speakers[0] = 77;
+		sample.replace(speakers);
+		assert_eq!(sample.overlay_sample(), Some((resumed_epoch, speakers)));
+	}
 
 	#[test]
 	fn call_cues_track_joins_and_departures_without_reconnect_noise() {
@@ -3130,7 +3306,7 @@ mod tests {
 		let transport = task.abort_handle();
 		let (controls, _control_events) = watch::channel(Controls::default());
 		let (_notices, events) = mpsc::sync_channel(8);
-		let (_speaking, speakers) = watch::channel([0; 64]);
+		let (_speaking, speakers) = watch::channel(SpeakerSnapshot::new());
 		let (_latency, latency) = watch::channel(ui::VoiceLatency::default());
 		let (camera_frames, _camera_frames) = mpsc::sync_channel(1);
 		let (stream_audio, _stream_audio) = mpsc::sync_channel(8);

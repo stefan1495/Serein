@@ -5165,6 +5165,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "pangocairo"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9f15369c787b1cc59a5b86eff6afffd5a9716c5beb4969d20b307cebfe7e407"
+dependencies = [
+ "cairo-rs",
+ "glib",
+ "libc",
+ "pango",
+ "pangocairo-sys",
+]
+
+[[package]]
+name = "pangocairo-sys"
+version = "0.22.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a649a616d67ae68539bc85f00fb45d36fba742ed20fc20e6712a15d8ee52bd3f"
+dependencies = [
+ "cairo-sys-rs",
+ "glib-sys",
+ "libc",
+ "pango-sys",
+ "system-deps 9.0.0",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5450,8 +5476,10 @@ dependencies = [
  "objc2-user-notifications 0.3.2",
  "objc2-video-toolbox",
  "objc2-web-kit",
+ "pangocairo",
  "rfd",
  "serde_json",
+ "smithay-client-toolkit 0.20.0",
  "symphonia",
  "tauri-winrt-notification",
  "tempfile",

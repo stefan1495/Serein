@@ -528,12 +528,16 @@ impl MessagingUi {
 										self.notification_settings(ui, state.demo)
 									}
 									Page::Activity => self.activity_settings(ui, state),
-									Page::Voice => self.voice_settings_content(
-										ui,
-										state.demo,
-										state.voice.active.is_some(),
-										false,
-									),
+									Page::Voice => {
+										#[cfg(target_os = "linux")]
+										self.voice_overlay_settings(ui);
+										self.voice_settings_content(
+											ui,
+											state.demo,
+											state.voice.active.is_some(),
+											false,
+										);
+									}
 									Page::Storage => self.storage_page(ui, state),
 									Page::Updates => self.update_settings(ui, state.demo),
 									Page::Keybinds => crate::keybinds::show(

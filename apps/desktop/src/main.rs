@@ -58,6 +58,8 @@ mod server_settings_demo;
 mod sign_in;
 #[cfg(feature = "demo")]
 mod slash_demo;
+#[cfg(target_os = "linux")]
+mod speaker_overlay;
 mod spotify;
 mod startup;
 mod sticker_upload;
@@ -1148,6 +1150,8 @@ struct Desktop {
 	font_families: Option<std::sync::mpsc::Receiver<Vec<String>>>,
 	updater: updater::Updater,
 	game_activity: toggle_setting::Settings,
+	#[cfg(target_os = "linux")]
+	voice_overlay: speaker_overlay::Overlay,
 	game_mentions: game_mentions::Loader,
 	registered_games: registered_games::Registered,
 	tray_setting: toggle_setting::Settings,
@@ -2724,6 +2728,8 @@ impl Desktop {
 			font_families: None,
 			updater: updater::Updater::new(demo),
 			game_activity,
+			#[cfg(target_os = "linux")]
+			voice_overlay: speaker_overlay::Overlay::new(&cc.egui_ctx),
 			game_mentions: Default::default(),
 			registered_games: if demo {
 				registered_games::Registered::default()
@@ -5052,6 +5058,9 @@ impl Desktop {
 					self.cache_status = error;
 				}
 				let stage = result.stage;
+				#[cfg(target_os = "linux")]
+				self.voice_overlay
+					.accept_avatar(&result.key, result.image.as_ref());
 				self.messaging
 					.accept_avatar(ctx, result.key.clone(), result.image);
 				if stage == avatars::DecodeStage::Settled {
@@ -5061,6 +5070,7 @@ impl Desktop {
 			}
 		}
 	}
+
 	fn poll_voice(&mut self, ctx: &egui::Context) {
 		if let Some(command) =
 			self.voice
@@ -5785,6 +5795,8 @@ impl Desktop {
 					);
 				}
 			}
+			#[cfg(target_os = "linux")]
+			self.voice_overlay.disable();
 			self.state.interrupt_gif_favorites();
 			self.state.interrupt_emoji_frecency();
 			self.connection = None;
@@ -6147,6 +6159,8 @@ impl eframe::App for Desktop {
 		}
 	}
 	fn on_exit(&mut self) {
+		#[cfg(target_os = "linux")]
+		self.voice_overlay.disable();
 		diagnostics::record(
 			diagnostics::Category::App,
 			diagnostics::Level::Info,
@@ -6576,6 +6590,13 @@ impl eframe::App for Desktop {
 		} else {
 			self.voice.stop();
 		}
+		#[cfg(target_os = "linux")]
+		self.voice_overlay.publish(
+			&self.state,
+			&mut self.messaging,
+			&self.voice,
+			self.avatars.as_ref(),
+		);
 		self.sync_tray(ctx);
 		if self.state.voice.active.is_some() {
 			// Speaking, notices, remote video, devices, hotkeys and deadlines each wake the UI

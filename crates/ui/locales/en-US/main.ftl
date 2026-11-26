@@ -4455,6 +4455,11 @@ voice-voice-processing-controls-start-the-microphone-test-or-join-a-call-to-see 
 voice-voice-processing-controls-suppression-strength = Suppression strength
 # Context: voice_settings_content
 # Context: voice_settings_content
+voice-overlay-heading = Voice overlay
+voice-overlay-description = Show avatars and server nicknames for people speaking in your call, at the top left of the selected monitor.
+voice-overlay-off = Off
+voice-overlay-unavailable = No supported Wayland monitor is available.
+
 voice-voice-settings-content-camera = Camera
 # Context: voice_settings_content
 voice-voice-settings-content-compare-with-the-other-participants-this-code-changes-with-the = Compare with the other participants. This code changes with the encrypted call group.

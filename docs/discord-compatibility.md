@@ -1936,6 +1936,12 @@ diagnostics. This changes observability, not the supported service contract. Off
 checks cover continued message delivery and heartbeat cursor advancement; normal-user service
 behavior remains unverified. See storage-policy.md for exact per-run limits and stderr handling.
 
+### Built-in voice overlay
+
+The [voice overlay](voice-overlay.md) renders the active call's current speakers locally on KDE
+Wayland. It does not implement Discord's voice RPC, add OAuth scopes, or share the roster with
+Discover or StreamKit. Game Activity IPC/WebSocket remains separate.
+
 ### Outgoing game IPC Rich Presence (September 11, 2026)
 
 The saved, off-by-default Game Activity setting now hosts a local activity-only IPC endpoint

@@ -34,6 +34,8 @@ impl Desktop {
 		if let Some(store) = &mut self.store {
 			store.cancel_load();
 		}
+		#[cfg(target_os = "linux")]
+		self.voice_overlay.disable();
 		self.credential_status = "";
 		self.voice.stop();
 		self.messaging.camera_test_requested = false;
@@ -99,6 +101,8 @@ impl Desktop {
 	/// Ends the current session. Only logging out removes this account's local data and
 	/// saved login; switching and adding keep both so the account stays in the switcher.
 	fn end_session(&mut self, ctx: &egui::Context, intent: SessionEnd) {
+		#[cfg(target_os = "linux")]
+		self.voice_overlay.disable();
 		self.captcha.close();
 		self.notification_runtime.clear(&self.window);
 		self.messaging.image_share_requested = None;

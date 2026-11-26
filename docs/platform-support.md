@@ -138,6 +138,13 @@ Windows/Linux local staging artifacts remain unsigned. These are not certified i
 
 The webview lives only during login: WKWebView on macOS, WebView2 on Windows, GTK/WebKitGTK on Linux. Linux uses a separate GTK authentication window and pumps it only while login is active. Voice is built in. Audio devices open only for explicit playback, device testing, or a call reaching required encrypted readiness. Popup-dependent authentication and third-party embedded challenges may not work; do not claim all Discord login methods without live tests.
 
+## Built-in voice overlay
+
+The [voice overlay](voice-overlay.md) targets KDE Plasma Wayland using layer-shell. It shows
+speakers on the configured monitor without taking focus or receiving clicks. Compositors that do
+not expose layer-shell, X11, Windows and macOS are outside this first implementation. It does not
+use a local voice socket or require an external overlay tool.
+
 ## Linux system appearance
 
 Appearance set to System reads the freedesktop Settings portal's color-scheme on

@@ -600,6 +600,10 @@ pub struct MessagingUi {
 	pub voice_latency: VoiceLatency,
 	/// Latest media activity, capped at 64 IDs (512 bytes) by the voice host.
 	pub voice_speaking: Vec<Id>,
+	#[cfg(target_os = "linux")]
+	pub voice_overlay_monitors: Vec<(String, String)>,
+	#[cfg(target_os = "linux")]
+	pub voice_overlay_monitor: Option<String>,
 	pub notifications_enabled: bool,
 	/// Show as Idle after the account's idle timeout of system inactivity, or on lock.
 	pub auto_idle: bool,

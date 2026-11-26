@@ -32,6 +32,8 @@ symphonia = { version = "=0.6.1", default-features = false, features = ["aac"] }
 wayland-backend = { version = "=0.3.17", features = ["client_system", "dlopen"] }
 wayland-client = "=0.31.15"
 wayland-protocols = { version = "=0.32.13", features = ["client", "staging"] }
+smithay-client-toolkit = { version = "=0.20.0", default-features = false, features = ["calloop"] }
+pangocairo = "=0.22.0"
 x11-dl = "=2.21.0"
 ksni = "=0.3.6"
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio", "blocking-api"] }
