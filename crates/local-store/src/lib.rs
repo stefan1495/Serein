@@ -130,6 +130,10 @@ pub struct AppPreferences {
 	pub voice_input: Option<String>,
 	pub voice_output: Option<String>,
 	pub voice_overlay_monitor: Option<String>,
+	/// Older preferences enabled the overlay by selecting an output.
+	pub voice_overlay_enabled: Option<bool>,
+	pub voice_overlay_position: Option<model::voice_overlay::Position>,
+	pub voice_overlay_appearance: model::voice_overlay::Appearance,
 	pub input_percent: u16,
 	pub output_percent: u16,
 	/// Which GPU renders the window; applied on the next start.
@@ -195,6 +199,9 @@ impl Default for AppPreferences {
 			voice_input: None,
 			voice_output: None,
 			voice_overlay_monitor: None,
+			voice_overlay_enabled: None,
+			voice_overlay_position: None,
+			voice_overlay_appearance: Default::default(),
 			input_percent: 100,
 			output_percent: 100,
 			gpu_preference: Default::default(),
@@ -214,6 +221,11 @@ impl Default for AppPreferences {
 	}
 }
 impl AppPreferences {
+	pub fn voice_overlay_enabled(&self) -> bool {
+		self.voice_overlay_enabled
+			.unwrap_or(self.voice_overlay_monitor.is_some())
+	}
+
 	pub fn is_valid(&self) -> bool {
 		self.window_geometry.is_none_or(WindowGeometry::is_valid)
 			&& self.language.as_ref().is_none_or(|language| {
@@ -226,7 +238,11 @@ impl AppPreferences {
 			&& self.blur <= 100
 			&& self.voice_overlay_monitor.as_ref().is_none_or(|name| {
 				!name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
-			}) && self.input_percent <= 200
+			}) && self
+			.voice_overlay_position
+			.is_none_or(model::voice_overlay::Position::is_valid)
+			&& self.voice_overlay_appearance.is_valid()
+			&& self.input_percent <= 200
 			&& self.output_percent <= 200
 			&& self
 				.voice_processing
@@ -2324,6 +2340,15 @@ mod tests {
 	fn app_preferences_round_trip_and_reject_invalid_replacement() {
 		let store = LocalStore::initialize(Connection::open_in_memory().unwrap()).unwrap();
 		assert_eq!(store.app_preferences().unwrap(), AppPreferences::default());
+		assert!(!store.app_preferences().unwrap().voice_overlay_enabled());
+		let legacy_overlay: AppPreferences =
+			serde_json::from_str(r#"{"voice_overlay_monitor":"DP-2"}"#).unwrap();
+		assert!(legacy_overlay.voice_overlay_enabled());
+		assert!(legacy_overlay.voice_overlay_position.is_none());
+		assert_eq!(
+			legacy_overlay.voice_overlay_appearance,
+			model::voice_overlay::Appearance::default()
+		);
 		let legacy: AppPreferences =
 			serde_json::from_str(r#"{"voice_noise_suppression":true}"#).unwrap();
 		assert!(legacy.voice_processing.is_none());
@@ -2408,6 +2433,14 @@ mod tests {
 			voice_deafened: true,
 			voice_input: Some("synthetic microphone".into()),
 			voice_overlay_monitor: Some("DP-2".into()),
+			voice_overlay_enabled: Some(false),
+			voice_overlay_position: Some(model::voice_overlay::Position { x: 3500, y: 10_000 }),
+			voice_overlay_appearance: model::voice_overlay::Appearance {
+				show_avatars: false,
+				font_family: Some("Synthetic Sans".into()),
+				background_opacity: 0,
+				..Default::default()
+			},
 			output_percent: 75,
 			gpu_preference: model::GpuPreference::PowerSaving,
 			graphics_api: model::GraphicsApi::OpenGl,
@@ -2417,6 +2450,12 @@ mod tests {
 		};
 		store.save_app_preferences(&value).unwrap();
 		assert_eq!(store.app_preferences().unwrap(), value);
+		value.voice_overlay_position.as_mut().unwrap().x = 10_001;
+		assert!(store.save_app_preferences(&value).is_err());
+		value.voice_overlay_position.as_mut().unwrap().x = 3500;
+		value.voice_overlay_appearance.font_family = Some("Invalid\nFamily".into());
+		assert!(store.save_app_preferences(&value).is_err());
+		value.voice_overlay_appearance.font_family = Some("Synthetic Sans".into());
 		value
 			.voice_processing
 			.as_mut()

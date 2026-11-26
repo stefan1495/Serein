@@ -16,6 +16,7 @@ page-messaging-permissions = Messaging Permissions
 page-notifications = Notifications
 page-registered-games = Registered Games
 page-voice = Voice & Video
+page-voice-overlay = Voice Overlay
 page-keybinds = Keybinds
 page-storage = Data & Privacy
 page-updates = Updates
@@ -30,6 +31,7 @@ description-messaging-permissions = Control who can contact you and how messages
 description-notifications = Choose which notifications you receive and how they appear.
 description-registered-games = Share what you play, and fix or add the games Serein detects.
 description-voice = Microphone, speakers, camera and voice processing.
+description-voice-overlay = Show who is speaking in your call and choose where the overlay appears.
 description-keybinds = Keyboard shortcuts for Serein.
 description-storage = What Serein keeps on this device.
 description-updates = Keep Serein up to date on this device.
@@ -4455,10 +4457,37 @@ voice-voice-processing-controls-start-the-microphone-test-or-join-a-call-to-see 
 voice-voice-processing-controls-suppression-strength = Suppression strength
 # Context: voice_settings_content
 # Context: voice_settings_content
-voice-overlay-heading = Voice overlay
-voice-overlay-description = Show avatars and server nicknames for people speaking in your call, at the top left of the selected monitor.
-voice-overlay-off = Off
-voice-overlay-unavailable = No supported Wayland monitor is available.
+voice-overlay-enable = Enable voice overlay
+voice-overlay-starting = Looking for Wayland displays…
+voice-overlay-unavailable = The voice overlay requires a native KDE Plasma Wayland session with layer-shell support.
+voice-overlay-editing-unavailable = This compositor does not support editing overlay placement.
+voice-overlay-disconnected = Display disconnected
+voice-overlay-no-displays = No displays are available.
+voice-overlay-no-selection = Select a display
+voice-overlay-display = Display
+voice-overlay-identify = Identify
+voice-overlay-edit = Edit placement and appearance
+voice-overlay-reset = Reset position
+voice-overlay-preview-help = Drag by the handle or change the appearance below. Only sample speakers appear on the selected display until you save or cancel.
+voice-overlay-drag-handle = Drag to move
+voice-overlay-save = Save
+voice-overlay-cancel = Cancel
+voice-overlay-appearance = Overlay appearance
+voice-overlay-avatars = Show avatars
+voice-overlay-avatar-size = Avatar size
+voice-overlay-font = Font family
+voice-overlay-font-default = System sans-serif
+voice-overlay-font-missing = This font is not installed. The overlay uses a system fallback.
+voice-overlay-font-size = Text size
+voice-overlay-font-weight = Font weight
+voice-overlay-weight-normal = Normal
+voice-overlay-weight-semibold = Semibold
+voice-overlay-weight-bold = Bold
+voice-overlay-text-color = Text color
+voice-overlay-background-color = Background color
+voice-overlay-accent-color = Speaking accent color
+voice-overlay-background-opacity = Background opacity
+voice-overlay-reset-appearance = Reset appearance
 
 voice-voice-settings-content-camera = Camera
 # Context: voice_settings_content

@@ -2645,6 +2645,8 @@ impl Desktop {
 			.ok()
 			.map(|menu| (menu, ui::i18n::Language::System))
 		};
+		#[cfg(target_os = "linux")]
+		let voice_overlay = speaker_overlay::Overlay::new(&cc.egui_ctx, &window);
 		Ok(Self {
 			proxy_auth: proxy_auth::Authentication::default(),
 			api_proxy: tokio::sync::watch::channel(None).0,
@@ -2729,7 +2731,7 @@ impl Desktop {
 			updater: updater::Updater::new(demo),
 			game_activity,
 			#[cfg(target_os = "linux")]
-			voice_overlay: speaker_overlay::Overlay::new(&cc.egui_ctx),
+			voice_overlay,
 			game_mentions: Default::default(),
 			registered_games: if demo {
 				registered_games::Registered::default()
@@ -6591,12 +6593,16 @@ impl eframe::App for Desktop {
 			self.voice.stop();
 		}
 		#[cfg(target_os = "linux")]
-		self.voice_overlay.publish(
-			&self.state,
-			&mut self.messaging,
-			&self.voice,
-			self.avatars.as_ref(),
-		);
+		{
+			self.voice_overlay
+				.receive(&mut self.messaging, self.state.user.is_some());
+			self.voice_overlay.publish(
+				&self.state,
+				&mut self.messaging,
+				&self.voice,
+				self.avatars.as_ref(),
+			);
+		}
 		self.sync_tray(ctx);
 		if self.state.voice.active.is_some() {
 			// Speaking, notices, remote video, devices, hotkeys and deadlines each wake the UI
@@ -7574,6 +7580,13 @@ impl eframe::App for Desktop {
 			frame.set_traffic_lights_position(&ctx, egui::Rangef::new(0.0, title_bar_height), 12.0);
 		}
 		self.sync_customization(&ctx);
+		#[cfg(target_os = "linux")]
+		if self
+			.voice_overlay
+			.receive(&mut self.messaging, self.state.user.is_some())
+		{
+			ctx.request_repaint();
+		}
 		self.save_app_preferences();
 		self.messaging.updates_save_failed = self.app_settings.state.failed;
 		self.save_reading_preferences(&ctx);

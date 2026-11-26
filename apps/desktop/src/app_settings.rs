@@ -80,9 +80,28 @@ impl Settings {
 			voice_input: ui.voice_input.clone(),
 			voice_output: ui.voice_output.clone(),
 			#[cfg(target_os = "linux")]
-			voice_overlay_monitor: ui.voice_overlay_monitor.clone(),
+			voice_overlay_monitor: ui.voice_overlay.saved.monitor.clone(),
 			#[cfg(not(target_os = "linux"))]
 			voice_overlay_monitor: self.current.voice_overlay_monitor.clone(),
+			#[cfg(target_os = "linux")]
+			voice_overlay_enabled: match self.current.voice_overlay_enabled {
+				None if ui.voice_overlay.enabled == self.current.voice_overlay_enabled()
+					&& ui.voice_overlay.enabled == ui.voice_overlay.saved.monitor.is_some() =>
+				{
+					None
+				}
+				_ => Some(ui.voice_overlay.enabled),
+			},
+			#[cfg(not(target_os = "linux"))]
+			voice_overlay_enabled: self.current.voice_overlay_enabled,
+			#[cfg(target_os = "linux")]
+			voice_overlay_position: ui.voice_overlay.saved.position,
+			#[cfg(not(target_os = "linux"))]
+			voice_overlay_position: self.current.voice_overlay_position,
+			#[cfg(target_os = "linux")]
+			voice_overlay_appearance: ui.voice_overlay.saved.appearance.clone(),
+			#[cfg(not(target_os = "linux"))]
+			voice_overlay_appearance: self.current.voice_overlay_appearance.clone(),
 			input_percent: ui.voice_gain.input_percent,
 			output_percent: ui.voice_gain.output_percent,
 			keybinds: ui.keybinds.clone(),
@@ -143,8 +162,18 @@ impl Settings {
 		ui.voice_input.clone_from(&value.voice_input);
 		ui.voice_output.clone_from(&value.voice_output);
 		#[cfg(target_os = "linux")]
-		ui.voice_overlay_monitor
-			.clone_from(&value.voice_overlay_monitor);
+		{
+			ui.voice_overlay.enabled = value.voice_overlay_enabled();
+			ui.voice_overlay
+				.saved
+				.monitor
+				.clone_from(&value.voice_overlay_monitor);
+			ui.voice_overlay.saved.position = value.voice_overlay_position;
+			ui.voice_overlay
+				.saved
+				.appearance
+				.clone_from(&value.voice_overlay_appearance);
+		}
 		ui.voice_gain.input_percent = value.input_percent;
 		ui.voice_gain.output_percent = value.output_percent;
 		ui.keybinds = value.keybinds.clone();
@@ -756,6 +785,30 @@ mod tests {
 			ui.voice_processing.effective().suppression,
 			model::voice_settings::NoiseSuppression::Off
 		);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn voice_overlay_enable_preference_preserves_the_saved_layout() {
+		let current: AppPreferences =
+			serde_json::from_str(r#"{"voice_overlay_monitor":"DP-2"}"#).unwrap();
+		let mut settings = Settings::from_preferences(Ok(current));
+		let mut ui = ui::MessagingUi::default();
+		settings.apply(&mut ui);
+		assert!(ui.voice_overlay.enabled);
+		assert!(ui.voice_overlay.saved.position.is_none());
+
+		let position = model::voice_overlay::Position { x: 4500, y: 7500 };
+		ui.voice_overlay.saved.position = Some(position);
+		ui.voice_overlay.enabled = false;
+		settings.observe(&ui);
+		assert_eq!(settings.current.voice_overlay_enabled, Some(false));
+		assert_eq!(
+			settings.current.voice_overlay_monitor.as_deref(),
+			Some("DP-2")
+		);
+		assert_eq!(settings.current.voice_overlay_position, Some(position));
+		assert!(settings.state.dirty);
 	}
 
 	#[test]

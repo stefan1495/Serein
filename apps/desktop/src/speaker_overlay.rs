@@ -2,6 +2,8 @@ use eframe::egui;
 use model::Id;
 use platform::speaker_layer::{self as layer, AVATAR_EDGE, MAX_ROWS};
 use std::{collections::HashMap, sync::Arc};
+use ui::voice_overlay::{Availability, Display, Mode};
+use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CallKey {
@@ -24,15 +26,78 @@ pub(crate) struct Overlay {
 }
 
 impl Overlay {
-	pub(crate) fn new(ctx: &egui::Context) -> Self {
-		let native = std::env::var_os("WAYLAND_DISPLAY").and_then(|_| {
-			let ctx = ctx.clone();
-			layer::Overlay::start(move || ctx.request_repaint())
+	pub(crate) fn new(ctx: &egui::Context, window: &winit::window::Window) -> Self {
+		let wayland = window
+			.display_handle()
+			.is_ok_and(|handle| matches!(handle.as_raw(), RawDisplayHandle::Wayland(_)));
+		let kde = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| {
+			desktop
+				.split(':')
+				.any(|name| name.eq_ignore_ascii_case("KDE"))
 		});
+		let native = (wayland && kde)
+			.then(|| {
+				let ctx = ctx.clone();
+				layer::Overlay::start(move || ctx.request_repaint())
+			})
+			.flatten();
 		Self {
 			native,
 			avatars: HashMap::new(),
 		}
+	}
+
+	pub(crate) fn receive(&mut self, ui: &mut ui::MessagingUi, session_visible: bool) -> bool {
+		let page_open = session_visible && ui.voice_overlay_page_open();
+		let settings = &mut ui.voice_overlay;
+		let mut changed = false;
+		if !page_open {
+			changed = settings.placement().is_some();
+			settings.cancel();
+		}
+		let Some(native) = &mut self.native else {
+			settings.set_displays(Availability::Unavailable, Vec::new());
+			return changed;
+		};
+		let status = native.status.borrow_and_update();
+		if status.has_changed() {
+			let (availability, displays) = match &*status {
+				layer::Status::Starting => (Availability::Starting, Vec::new()),
+				layer::Status::Unavailable => (Availability::Unavailable, Vec::new()),
+				layer::Status::Available {
+					monitors,
+					editing,
+					fonts,
+				} => {
+					settings.fonts.clone_from(fonts);
+					(
+						if *editing {
+							Availability::Available
+						} else {
+							Availability::EditingUnavailable
+						},
+						monitors
+							.iter()
+							.map(|monitor| Display {
+								name: monitor.name.clone(),
+								label: monitor.label.clone(),
+							})
+							.collect(),
+					)
+				}
+			};
+			settings.set_displays(availability, displays);
+		}
+		drop(status);
+		if let Some(edit) = &*native.edit.borrow_and_update() {
+			match edit.state {
+				layer::EditState::Placement { position, dragging } => {
+					settings.report_drag(edit.generation, &edit.monitor, position, dragging)
+				}
+				layer::EditState::Closed => settings.report_closed(edit.generation, &edit.monitor),
+			}
+		}
+		changed | settings.save_if_requested()
 	}
 
 	pub(crate) fn disable(&mut self) {
@@ -72,33 +137,42 @@ impl Overlay {
 		voice: &crate::voice::Voice,
 		worker: Option<&crate::avatars::AvatarWorker>,
 	) {
-		let Some(native) = &mut self.native else {
+		let Some(native) = &self.native else {
 			return;
 		};
-		{
-			let status = native.status.borrow_and_update();
-			if status.has_changed() {
-				ui.voice_overlay_monitors = match &*status {
-					layer::Status::Available(monitors) => monitors
-						.iter()
-						.map(|m| (m.name.clone(), m.label.clone()))
-						.collect(),
-					_ => Vec::new(),
-				};
-			}
-		}
-		let monitor = ui
-			.voice_overlay_monitor
+		let settings = &ui.voice_overlay;
+		let editor = settings.placement().map(|placement| layer::Editor {
+			generation: placement.generation,
+			monitor: placement.monitor.clone(),
+			position: placement.initial,
+			mode: match placement.mode {
+				Mode::Identify(until) => layer::Mode::Identify { until },
+				Mode::Preview => layer::Mode::Preview {
+					handle: ui.language.text("voice-overlay-drag-handle"),
+				},
+			},
+		});
+		let position = settings.saved.position;
+		let appearance = settings.saved.appearance.clone();
+		let preview_appearance = settings.preview_appearance().cloned();
+		let monitor = settings
+			.saved
+			.monitor
 			.as_ref()
-			.filter(|name| ui.voice_overlay_monitors.iter().any(|(id, _)| id == *name))
+			.filter(|name| settings.enabled && settings.connected(name))
 			.cloned();
+
 		let mut rows = Vec::new();
 		if monitor.is_some() {
 			if state.demo {
 				rows.push((
 					Id(1),
 					"Demo speaker".into(),
-					state.user.as_ref().map(model::User::avatar_key),
+					state
+						.user
+						.as_ref()
+						.filter(|_| appearance.show_avatars)
+						.map(model::User::avatar_key),
 				));
 			} else if state.auth == client_core::auth::AuthState::Authenticated
 				&& state.gateway_connected
@@ -119,12 +193,15 @@ impl Overlay {
 						.filter(|ch| !ch.is_control())
 						.take(80)
 						.collect();
-					rows.insert(index, (id, name, user.map(model::User::avatar_key)));
+					let avatar = user
+						.filter(|_| appearance.show_avatars)
+						.map(model::User::avatar_key);
+					rows.insert(index, (id, name, avatar));
 				}
 			}
 		}
 		// Retain recent avatars through brief silences, without growing beyond two full overlays.
-		if monitor.is_none() {
+		if monitor.is_none() || !appearance.show_avatars {
 			self.avatars.clear();
 		} else if self.avatars.len() > MAX_ROWS {
 			self.avatars.retain(|key, _| {
@@ -147,7 +224,14 @@ impl Overlay {
 				layer::Speaker { name, avatar }
 			})
 			.collect();
-		native.update(layer::Frame { monitor, rows });
+		native.update(layer::Frame {
+			monitor,
+			rows,
+			position,
+			editor,
+			appearance,
+			preview_appearance,
+		});
 	}
 }
 

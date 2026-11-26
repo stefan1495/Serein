@@ -42,34 +42,6 @@ pub struct VoiceRosterRow<'a> {
 }
 
 impl MessagingUi {
-	#[cfg(target_os = "linux")]
-	pub(super) fn voice_overlay_settings(&mut self, ui: &mut egui::Ui) {
-		ui.heading(self.language.text("voice-overlay-heading"));
-		ui.label(self.language.text("voice-overlay-description"));
-		let off = self.language.text("voice-overlay-off");
-		let selected = self
-			.voice_overlay_monitor
-			.as_ref()
-			.map_or(off.as_str(), |name| {
-				self.voice_overlay_monitors
-					.iter()
-					.find(|(id, _)| id == name)
-					.map_or(name, |(_, label)| label)
-			});
-		egui::ComboBox::from_id_salt("speaker-overlay-monitor")
-			.selected_text(selected)
-			.show_ui(ui, |ui| {
-				ui.selectable_value(&mut self.voice_overlay_monitor, None, off);
-				for (name, label) in &self.voice_overlay_monitors {
-					ui.selectable_value(&mut self.voice_overlay_monitor, Some(name.clone()), label);
-				}
-			});
-		if self.voice_overlay_monitors.is_empty() {
-			ui.label(self.language.text("voice-overlay-unavailable"));
-		}
-		ui.separator();
-	}
-
 	pub(super) fn exit_voice_fullscreen(&mut self) {
 		if let Some((_, ctx, previous, focus)) = self.voice_fullscreen.take() {
 			self.voice_fullscreen_request = Some(previous);

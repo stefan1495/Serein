@@ -29,6 +29,7 @@ enum Page {
 	/// Discord's Registered Games: activity sharing, the current game and Added Games.
 	Activity,
 	Voice,
+	VoiceOverlay,
 	Keybinds,
 	/// Display language and clock style.
 	LanguageTime,
@@ -39,7 +40,7 @@ enum Page {
 }
 impl Page {
 	/// Every page in sidebar order; the narrow-window page picker lists them the same way.
-	const ALL: [Self; 15] = [
+	const ALL: [Self; 16] = [
 		Self::Account,
 		Self::Profile,
 		Self::MessagingPermissions,
@@ -48,6 +49,7 @@ impl Page {
 		Self::Chat,
 		Self::Notifications,
 		Self::Voice,
+		Self::VoiceOverlay,
 		Self::Keybinds,
 		Self::Activity,
 		Self::LanguageTime,
@@ -75,6 +77,7 @@ impl Page {
 				Self::Chat,
 				Self::Notifications,
 				Self::Voice,
+				Self::VoiceOverlay,
 				Self::Keybinds,
 				Self::Activity,
 				Self::LanguageTime,
@@ -94,7 +97,8 @@ impl Page {
 	}
 	/// Whether the page is offered: every page when signed in, the few above when not.
 	fn offered(self, signed_out: bool) -> bool {
-		!signed_out || self.signed_out()
+		(cfg!(target_os = "linux") || self != Self::VoiceOverlay)
+			&& (!signed_out || self.signed_out())
 	}
 	fn label_key(self) -> &'static str {
 		match self {
@@ -108,6 +112,7 @@ impl Page {
 			Self::Notifications => "page-notifications",
 			Self::Activity => "page-registered-games",
 			Self::Voice => "page-voice",
+			Self::VoiceOverlay => "page-voice-overlay",
 			Self::Keybinds => "page-keybinds",
 			Self::Storage => "page-storage",
 			Self::Updates => "page-updates",
@@ -130,6 +135,7 @@ impl Page {
 			Self::Notifications => "description-notifications",
 			Self::Activity => "description-registered-games",
 			Self::Voice => "description-voice",
+			Self::VoiceOverlay => "description-voice-overlay",
 			Self::Keybinds => "description-keybinds",
 			Self::Storage => "description-storage",
 			Self::Updates => "description-updates",
@@ -164,6 +170,9 @@ impl Page {
 			}
 			Self::Voice => {
 				"voice video camera preview audio microphone speakers devices volume gain noise suppression push to talk"
+			}
+			Self::VoiceOverlay => {
+				"voice overlay monitor display speaker position placement identify drag kde wayland"
 			}
 			Self::LanguageTime => {
 				"language time clock 12 hour 24 hour am pm format locale translation"
@@ -318,6 +327,10 @@ impl MessagingUi {
 
 	pub fn voice_settings_open(&self) -> bool {
 		self.settings.open && self.settings.page == Page::Voice
+	}
+
+	pub fn voice_overlay_page_open(&self) -> bool {
+		self.settings.open && self.settings.page == Page::VoiceOverlay
 	}
 
 	pub(super) fn open_voice_settings(&mut self) {
@@ -529,14 +542,15 @@ impl MessagingUi {
 									}
 									Page::Activity => self.activity_settings(ui, state),
 									Page::Voice => {
-										#[cfg(target_os = "linux")]
-										self.voice_overlay_settings(ui);
 										self.voice_settings_content(
 											ui,
 											state.demo,
 											state.voice.active.is_some(),
 											false,
 										);
+									}
+									Page::VoiceOverlay => {
+										self.voice_overlay.show(ui, self.language)
 									}
 									Page::Storage => self.storage_page(ui, state),
 									Page::Updates => self.update_settings(ui, state.demo),

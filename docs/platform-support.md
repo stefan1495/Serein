@@ -140,10 +140,12 @@ The webview lives only during login: WKWebView on macOS, WebView2 on Windows, GT
 
 ## Built-in voice overlay
 
-The [voice overlay](voice-overlay.md) targets KDE Plasma Wayland using layer-shell. It shows
-speakers on the configured monitor without taking focus or receiving clicks. Compositors that do
-not expose layer-shell, X11, Windows and macOS are outside this first implementation. It does not
-use a local voice socket or require an external overlay tool.
+The [voice overlay](voice-overlay.md) uses layer-shell on native KDE Plasma Wayland. Live rows
+on the configured display never take focus or receive clicks. The placement editor also needs
+subsurfaces, viewporter and logical output dimensions. Its temporary surface only accepts input
+on the preview's drag handle; Identify is fully click-through. There is no focusable-window
+fallback, local voice socket or external overlay tool. Other compositors, X11, Windows and macOS
+are outside this implementation.
 
 ## Linux system appearance
 
