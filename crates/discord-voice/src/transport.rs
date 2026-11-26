@@ -392,6 +392,74 @@ pub async fn run_with_identity(
 	})
 	.await
 }
+enum SpeakerEpoch {
+	Current,
+	Securing,
+	NeedsSample,
+}
+
+struct SpeakerPublisher {
+	next: Instant,
+	last: [u64; 64],
+	epoch: SpeakerEpoch,
+}
+
+impl SpeakerPublisher {
+	fn new(now: Instant) -> Self {
+		Self {
+			next: now,
+			last: [0; 64],
+			epoch: SpeakerEpoch::Current,
+		}
+	}
+
+	fn progress(
+		&mut self,
+		status: Status,
+		emit: &impl Fn(Status) -> Result<(), ()>,
+	) -> Result<(), &'static str> {
+		match &status {
+			// Consumers invalidate their sample on Securing, so deduplication must not
+			// hide the first sample once they can accept it again.
+			Status::Securing => self.epoch = SpeakerEpoch::Securing,
+			Status::WaitingForPeer | Status::Ready { .. }
+				if matches!(self.epoch, SpeakerEpoch::Securing) =>
+			{
+				self.epoch = SpeakerEpoch::NeedsSample;
+			}
+			_ => {}
+		}
+		emit(status).map_err(|_| "Call interface closed")
+	}
+
+	fn publish(
+		&mut self,
+		now: Instant,
+		local: u64,
+		remote: impl Iterator<Item = u64>,
+		emit: &impl Fn(Status) -> Result<(), ()>,
+	) -> Result<(), &'static str> {
+		if now < self.next {
+			return Ok(());
+		}
+		self.next = now + Duration::from_millis(100);
+		let mut users = [0; 64];
+		users[0] = local;
+		for (slot, user) in users[1..].iter_mut().zip(remote) {
+			*slot = user;
+		}
+		let fresh_epoch = matches!(self.epoch, SpeakerEpoch::NeedsSample);
+		if fresh_epoch || users != self.last {
+			emit(Status::Speaking(Box::new(users))).map_err(|_| "Call interface closed")?;
+			self.last = users;
+			if fresh_epoch {
+				self.epoch = SpeakerEpoch::Current;
+			}
+		}
+		Ok(())
+	}
+}
+
 #[allow(clippy::too_many_arguments)] // Public media inputs plus the loopback-only test endpoint.
 async fn run_inner(
 	credentials: VoiceConnection,
@@ -533,8 +601,7 @@ async fn run_inner(
 	let mut capture_enabled = false;
 	let mut capture_reset = true;
 	let mut local_activity = 0;
-	let mut last_speakers = [0; 64];
-	let mut speakers_at = Instant::now();
+	let mut speakers = SpeakerPublisher::new(Instant::now());
 	loop {
 		if let Some(reason) = reconnect.take() {
 			if encryption.is_none() || resume_attempts >= 2 {
@@ -552,7 +619,7 @@ async fn run_inner(
 			waiting_announced = false;
 			capture_reset = true;
 			emit(Status::Latency(None)).map_err(|_| "Call interface closed")?;
-			emit(Status::Securing).map_err(|_| "Call interface closed")?;
+			speakers.progress(Status::Securing, &emit)?;
 			deadline = Some(Instant::now() + Duration::from_secs(30));
 			heartbeat_ms = None;
 			awaiting_ack = None;
@@ -619,12 +686,12 @@ async fn run_inner(
 					   if secured_at.is_some_and(|at| now>=at+PEER_GRACE) && !discovering && !resuming && dave.should_wait_for_peer() {dave.enter_sole_member_waiting()?;}
 					   let enabled=dave.ready && encryption.is_some() && !discovering && !resuming;
 					   let waiting=dave.waiting && encryption.is_some() && !discovering && !resuming;
-					   if (!enabled && ready_announced) || (!waiting && waiting_announced) {ready_announced=false;waiting_announced=false;emit(Status::Securing).map_err(|_|"Call interface closed")?;}
-					   if waiting && !waiting_announced {deadline=None;waiting_announced=true;emit(Status::WaitingForPeer).map_err(|_|"Call interface closed")?;}
+					   if (!enabled && ready_announced) || (!waiting && waiting_announced) {ready_announced=false;waiting_announced=false;speakers.progress(Status::Securing,&emit)?;}
+					   if waiting && !waiting_announced {deadline=None;waiting_announced=true;speakers.progress(Status::WaitingForPeer,&emit)?;}
 					   if !waiting {waiting_announced=false;}
 					   if enabled && !ready_announced {
 						   deadline=None;ready_announced=true;
-						   emit(Status::Ready{privacy_code:dave.session.voice_privacy_code().unwrap_or_default().into()}).map_err(|_|"Call interface closed")?;
+						   speakers.progress(Status::Ready{privacy_code:dave.session.voice_privacy_code().unwrap_or_default().into()},&emit)?;
 					   }
 					   if enabled && let Some(decoder)=&decoder {
 						   receive_video(&mut receivers,decoder,&mut dave,&mut metrics,None)?;
@@ -752,16 +819,8 @@ async fn run_inner(
 					   let [bridge_drops,bridge_underruns]=stream_playout.take_stats();
 					   metrics.stream_audio([0,0,0,0,0,0,0,0,bridge_drops,bridge_underruns]);
 					   metrics.poll(false, drops, stalled, 0);
-					   if now >= speakers_at {
-						   let mut users=[0;64];
-						   users[0]=if local_activity>0 {credentials.user.0} else {0};
-						   for (slot,user) in users[1..].iter_mut().zip(mixer.speaking()) {*slot=user;}
-						   if users != last_speakers {
-							   emit(Status::Speaking(Box::new(users))).map_err(|_|"Call interface closed")?;
-							   last_speakers=users;
-						   }
-						   speakers_at=now+Duration::from_millis(100);
-					   }
+					   let local_speaker=if local_activity>0 {credentials.user.0} else {0};
+					   speakers.publish(now,local_speaker,mixer.speaking(),&emit)?;
 				   },
 				   result=async {match &udp {Some(socket)=>socket.recv(&mut packet).await,None=>std::future::pending().await}}=>{
 					   let length=match result {Ok(length)=>length,Err(error) if transient_receive(&error)=>continue,Err(_)=>return Err("Voice UDP receive failed")};
@@ -870,7 +929,7 @@ async fn run_inner(
 									   if camera.is_some(){emit(Status::CameraAvailable(video.available())).map_err(|_|"Call interface closed")?;}
 									   send(&mut ws,Message::Binary(dave.key_package()?.into())).await?;
 									   emit(Status::TransportReady).map_err(|_|"Call interface closed")?;
-									   emit(Status::Securing).map_err(|_|"Call interface closed")?;
+									   speakers.progress(Status::Securing,&emit)?;
 								   },
 								   5=>{
 									   let user=id(data,"user_id")?;
@@ -905,7 +964,7 @@ async fn run_inner(
 											   deadline=None;
 											   waiting_announced=true;
 											   ready_announced=false;
-											   emit(Status::WaitingForPeer).map_err(|_|"Call interface closed")?;
+											   speakers.progress(Status::WaitingForPeer,&emit)?;
 										   } else if was_ready {
 											   // The remaining members still share the current epoch until the removal commit.
 											   dave.ready=true;
@@ -932,7 +991,7 @@ async fn run_inner(
 											   deadline=None;
 											   waiting_announced=true;
 											   ready_announced=false;
-											   emit(Status::WaitingForPeer).map_err(|_|"Call interface closed")?;
+											   speakers.progress(Status::WaitingForPeer,&emit)?;
 										   } else {
 											   dave.pending_protocol=None;dave.ready=false;
 										   }
@@ -992,7 +1051,7 @@ async fn run_inner(
 									   } else {
 										   capture_reset=true;mixer.clear();
 										   deadline=Some(Instant::now()+Duration::from_secs(30));
-										   emit(Status::Securing).map_err(|_|"Call interface closed")?;
+										   speakers.progress(Status::Securing,&emit)?;
 									   }
 								   },
 								   _=>return Err("Unsupported DAVE opcode; call stopped"),
@@ -1926,6 +1985,56 @@ mod tests {
 	use super::*;
 	use crate::video_receive::Receivers;
 	use opus2::Decoder;
+
+	#[test]
+	fn speaker_publisher_repeats_unchanged_waiting_activity_after_securing() {
+		let start = Instant::now();
+		let mut speakers = SpeakerPublisher::new(start);
+		let samples = std::cell::RefCell::new(Vec::new());
+		let emit = |status| {
+			if let Status::Speaking(users) = status {
+				samples.borrow_mut().push(users);
+			}
+			Ok(())
+		};
+		let ready = || Status::Ready {
+			privacy_code: String::new(),
+		};
+		let publish = |speakers: &mut SpeakerPublisher, millis| {
+			speakers
+				.publish(
+					start + Duration::from_millis(millis),
+					42,
+					std::iter::empty(),
+					&emit,
+				)
+				.unwrap();
+		};
+
+		speakers.progress(Status::WaitingForPeer, &emit).unwrap();
+		publish(&mut speakers, 0);
+		let waiting = samples.borrow_mut().pop().unwrap();
+		assert_eq!(waiting[0], 42);
+
+		speakers.progress(Status::Securing, &emit).unwrap();
+		speakers.progress(ready(), &emit).unwrap();
+		publish(&mut speakers, 20);
+		assert!(
+			samples.borrow().is_empty(),
+			"readiness must not bypass the rate limit"
+		);
+		publish(&mut speakers, 100);
+		assert_eq!(samples.borrow_mut().pop(), Some(waiting));
+
+		// A privacy-code update can re-announce Ready without invalidating the sample.
+		speakers.progress(ready(), &emit).unwrap();
+		publish(&mut speakers, 200);
+		assert!(
+			samples.borrow().is_empty(),
+			"unchanged samples are deduplicated again"
+		);
+	}
+
 	#[test]
 	fn camera_transition_requests_a_keyframe_despite_the_feedback_throttle() {
 		let frame = |sequence, keyframe| crate::camera_video::Frame {

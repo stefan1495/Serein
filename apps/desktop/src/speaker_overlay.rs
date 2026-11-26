@@ -81,6 +81,7 @@ impl Overlay {
 							.map(|monitor| Display {
 								name: monitor.name.clone(),
 								label: monitor.label.clone(),
+								live_supported: monitor.live_supported,
 							})
 							.collect(),
 					)
@@ -137,6 +138,7 @@ impl Overlay {
 		voice: &crate::voice::Voice,
 		worker: Option<&crate::avatars::AvatarWorker>,
 	) {
+		ui.voice_overlay.paused_after_move = false;
 		let Some(native) = &self.native else {
 			return;
 		};
@@ -159,9 +161,15 @@ impl Overlay {
 			.saved
 			.monitor
 			.as_ref()
-			.filter(|name| settings.enabled && settings.connected(name))
+			.filter(|name| settings.enabled && settings.live_supported(name))
 			.cloned();
 
+		let source = if monitor.is_some() && !state.demo {
+			voice.overlay_source(state)
+		} else {
+			None
+		};
+		ui.voice_overlay.paused_after_move = matches!(source, Some(Err(_)));
 		let mut rows = Vec::new();
 		if monitor.is_some() {
 			if state.demo {
@@ -174,10 +182,7 @@ impl Overlay {
 						.filter(|_| appearance.show_avatars)
 						.map(model::User::avatar_key),
 				));
-			} else if state.auth == client_core::auth::AuthState::Authenticated
-				&& state.gateway_connected
-				&& let Some((_, speakers)) = voice.overlay_source(state)
-			{
+			} else if let Some(Ok((_, speakers))) = source {
 				for (id, name, user) in ui.active_voice_speakers(state, &speakers) {
 					let Err(index) = rows.binary_search_by_key(&id, |(id, _, _)| *id) else {
 						continue;

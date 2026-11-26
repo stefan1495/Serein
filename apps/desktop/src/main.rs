@@ -3063,6 +3063,11 @@ impl Desktop {
 			return;
 		}
 		self.app_settings.observe(&self.messaging);
+		#[cfg(target_os = "linux")]
+		if self.messaging.voice_overlay.take_retry_request() {
+			self.app_settings
+				.retry_overlay_save(&self.messaging.voice_overlay, self.cache.is_some());
+		}
 		self.cache_pending += usize::from(
 			self.app_settings
 				.save(self.cache.as_ref(), self.state.generation),
@@ -5127,8 +5132,7 @@ impl Desktop {
 					continue;
 				}
 				cache::Outcome::AppPreferencesSaved(result) => {
-					self.app_settings.state.saving = false;
-					self.app_settings.state.failed = result.is_err();
+					self.app_settings.save_completed(result.is_ok());
 					continue;
 				}
 				cache::Outcome::MinimizeToTray(result) => {
@@ -7589,6 +7593,20 @@ impl eframe::App for Desktop {
 		}
 		self.save_app_preferences();
 		self.messaging.updates_save_failed = self.app_settings.state.failed;
+		#[cfg(target_os = "linux")]
+		{
+			let overlay = &mut self.messaging.voice_overlay;
+			let persistence = if self.fixture_only || self.state.demo {
+				ui::voice_overlay::Persistence::Idle
+			} else {
+				self.app_settings
+					.overlay_persistence(overlay, self.cache.is_some())
+			};
+			if overlay.persistence != persistence {
+				overlay.persistence = persistence;
+				ctx.request_repaint();
+			}
+		}
 		self.save_reading_preferences(&ctx);
 		self.sync_own_presence(&ctx);
 		self.sync_game_activity(&ctx);

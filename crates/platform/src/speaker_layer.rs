@@ -30,7 +30,7 @@ use smithay_client_toolkit::{
 use std::{sync::Arc, time::Instant};
 use tokio::sync::watch;
 use wayland_client::{
-	Connection, QueueHandle, delegate_noop,
+	Connection, Proxy, QueueHandle, delegate_noop,
 	globals::registry_queue_init,
 	protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
@@ -50,6 +50,7 @@ pub struct Monitor {
 	pub name: String,
 	pub label: String,
 	pub logical_size: (i32, i32),
+	pub live_supported: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -194,6 +195,8 @@ impl Shell {
 					name,
 					label,
 					logical_size,
+					live_supported: self.viewporter.is_some()
+						|| geometry::extent(logical_size) == geometry::FOOTPRINT,
 				},
 			))
 		})
@@ -289,7 +292,8 @@ impl Shell {
 			.monitor
 			.as_ref()
 			.filter(|_| !preview && !frame.rows.is_empty())
-			.and_then(|name| self.output(name));
+			.and_then(|name| self.output(name))
+			.filter(|(_, monitor)| monitor.live_supported);
 		if self.layer.as_ref().map(|live| &live.output) != target.as_ref().map(|(output, _)| output)
 		{
 			self.layer = None;
@@ -298,10 +302,6 @@ impl Shell {
 			return Ok(());
 		};
 		let size = geometry::extent(monitor.logical_size);
-		if self.viewporter.is_none() && size != geometry::FOOTPRINT {
-			self.layer = None;
-			return Ok(());
-		}
 		let offset = geometry::offset(monitor.logical_size, frame.position);
 		if self.layer.is_none() {
 			let surface = self.compositor.create_surface(qh);
@@ -408,6 +408,10 @@ fn run(
 	let red = pixel(0xfff02d3a)?;
 	let viewporter = globals.bind(&qh, 1..=1, ()).ok();
 	let compositor = CompositorState::bind(&globals, &qh).map_err(|_| ())?;
+	// The row and placement buffers use wl_surface.damage_buffer (since version 4).
+	if compositor.wl_compositor().version() < 4 {
+		return Err(());
+	}
 	let subcompositor =
 		SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh).ok();
 	let mut state = Shell {

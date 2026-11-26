@@ -8,12 +8,46 @@ pub struct Settings {
 	pub current: AppPreferences,
 	pub loaded: bool,
 	pub state: crate::toggle_setting::Settings,
+	#[cfg(target_os = "linux")]
+	pub(crate) persisted_overlay: Option<OverlayPreferences>,
+	#[cfg(target_os = "linux")]
+	pub(crate) overlay_in_flight: Option<OverlayPreferences>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq)]
+pub(crate) struct OverlayPreferences {
+	enabled: bool,
+	layout: ui::voice_overlay::Layout,
+}
+
+#[cfg(target_os = "linux")]
+impl OverlayPreferences {
+	fn from_preferences(value: &AppPreferences) -> Self {
+		Self {
+			enabled: value.voice_overlay_enabled(),
+			layout: ui::voice_overlay::Layout {
+				monitor: value.voice_overlay_monitor.clone(),
+				position: value.voice_overlay_position,
+				appearance: value.voice_overlay_appearance.clone(),
+			},
+		}
+	}
+
+	fn matches(&self, overlay: &ui::voice_overlay::Settings) -> bool {
+		self.enabled == overlay.enabled && self.layout == overlay.saved
+	}
 }
 
 impl Settings {
 	pub fn from_preferences(value: Result<AppPreferences, local_store::StoreError>) -> Self {
 		let mut settings = Self {
 			loaded: value.is_ok(),
+			#[cfg(target_os = "linux")]
+			persisted_overlay: value
+				.as_ref()
+				.ok()
+				.map(OverlayPreferences::from_preferences),
 			current: value.unwrap_or_default(),
 			..Self::default()
 		};
@@ -36,12 +70,74 @@ impl Settings {
 				crate::cache::Operation::SaveAppPreferences(Box::new(self.current.clone())),
 			)
 		});
+		self.save_attempted(accepted);
+		accepted
+	}
+
+	fn save_attempted(&mut self, accepted: bool) {
 		// A full cache queue must not turn a device preference into a session-only change.
 		self.state.dirty = !accepted;
 		self.state.saving = accepted;
 		self.state.failed = !accepted;
-		accepted
+		#[cfg(target_os = "linux")]
+		if accepted {
+			self.overlay_in_flight = Some(OverlayPreferences::from_preferences(&self.current));
+		}
 	}
+
+	pub fn save_completed(&mut self, success: bool) {
+		self.state.saving = false;
+		self.state.failed = !success;
+		#[cfg(target_os = "linux")]
+		if let Some(written) = self.overlay_in_flight.take()
+			&& success
+		{
+			self.persisted_overlay = Some(written);
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	pub fn overlay_persistence(
+		&self,
+		overlay: &ui::voice_overlay::Settings,
+		cache_available: bool,
+	) -> ui::voice_overlay::Persistence {
+		use ui::voice_overlay::Persistence;
+		let Some(persisted) = &self.persisted_overlay else {
+			return Persistence::NotLoaded;
+		};
+		// An older accepted write can still replace the on-disk layout after a user reverts.
+		if persisted.matches(overlay)
+			&& self
+				.overlay_in_flight
+				.as_ref()
+				.is_none_or(|value| value == persisted)
+		{
+			return Persistence::Idle;
+		}
+		if self.state.failed {
+			return Persistence::Failed {
+				retry: cache_available
+					&& !self.state.saving
+					&& OverlayPreferences::from_preferences(&self.current).matches(overlay),
+			};
+		}
+		Persistence::Saving
+	}
+
+	#[cfg(target_os = "linux")]
+	pub fn retry_overlay_save(
+		&mut self,
+		overlay: &ui::voice_overlay::Settings,
+		cache_available: bool,
+	) {
+		if self.overlay_persistence(overlay, cache_available)
+			== (ui::voice_overlay::Persistence::Failed { retry: true })
+		{
+			self.state.dirty = true;
+		}
+	}
+
 	/// Marks changed, valid device preferences for asynchronous persistence.
 	pub fn observe(&mut self, ui: &ui::MessagingUi) {
 		let value = AppPreferences {
@@ -785,6 +881,25 @@ mod tests {
 			ui.voice_processing.effective().suppression,
 			model::voice_settings::NoiseSuppression::Off
 		);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn voice_overlay_retry_cannot_authorize_overwriting_unread_preferences() {
+		let mut settings = Settings::from_preferences(Err(local_store::StoreError::Unavailable));
+		let mut ui = ui::MessagingUi::default();
+		settings.apply(&mut ui);
+		ui.voice_overlay.saved.monitor = Some("DP-1".into());
+		settings.observe(&ui);
+		assert_eq!(
+			settings.overlay_persistence(&ui.voice_overlay, true),
+			ui::voice_overlay::Persistence::NotLoaded,
+		);
+		let store = local_store::LocalStore::open(std::path::Path::new(":memory:")).unwrap();
+		let cache = crate::cache::Cache::start(eframe::egui::Context::default(), Some(store));
+		settings.retry_overlay_save(&ui.voice_overlay, true);
+		assert!(!settings.save(Some(&cache), 1));
+		assert!(settings.state.failed);
 	}
 
 	#[cfg(target_os = "linux")]

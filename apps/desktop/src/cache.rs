@@ -904,6 +904,78 @@ mod tests {
 		std::fs::remove_dir(root).unwrap();
 	}
 
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn voice_overlay_retry_persists_the_latest_applied_preferences_after_a_write_failure() {
+		use ui::voice_overlay::Persistence;
+
+		let (send, commands) = mpsc::sync_channel(1);
+		let (_, receive) = mpsc::sync_channel(1);
+		let cache = Cache {
+			send,
+			receive,
+			budget: Arc::new(Budget::default()),
+			history: Arc::new(HistorySafety::default()),
+		};
+		let mut store = Ok(LocalStore::open(std::path::Path::new(":memory:")).unwrap());
+		let mut settings = crate::app_settings::Settings::from_preferences(
+			store.as_ref().unwrap().app_preferences(),
+		);
+		let mut view = ui::MessagingUi::default();
+		settings.apply(&mut view);
+		let persistence = |settings: &crate::app_settings::Settings, view: &ui::MessagingUi| {
+			settings.overlay_persistence(&view.voice_overlay, true)
+		};
+		let finish = |settings: &mut crate::app_settings::Settings, store: &mut _| {
+			let (_, account, epoch, operation, _reservation) = commands.try_recv().unwrap();
+			let Outcome::AppPreferencesSaved(result) =
+				execute(store, &cache.history, account, epoch, operation)
+			else {
+				panic!("expected an app preferences write");
+			};
+			settings.save_completed(result.is_ok());
+		};
+
+		view.voice_overlay.saved.monitor = Some("DP-1".into());
+		settings.observe(&view);
+		assert!(settings.save(Some(&cache), 1));
+		assert_eq!(persistence(&settings, &view), Persistence::Saving);
+		view.voice_overlay.saved.monitor = None;
+		settings.observe(&view);
+		assert_eq!(persistence(&settings, &view), Persistence::Saving);
+		view.voice_overlay.saved.monitor = Some("DP-2".into());
+		view.notifications_enabled = !view.notifications_enabled;
+		settings.observe(&view);
+		assert!(!settings.save(Some(&cache), 1));
+		finish(&mut settings, &mut store);
+		assert_eq!(persistence(&settings, &view), Persistence::Saving);
+		assert!(settings.save(Some(&cache), 1));
+		finish(&mut settings, &mut Err(StoreError::Unavailable));
+		assert!(settings.state.failed);
+		assert_eq!(
+			persistence(&settings, &view),
+			Persistence::Failed { retry: true }
+		);
+		assert!(!settings.save(Some(&cache), 1));
+
+		settings.retry_overlay_save(&view.voice_overlay, true);
+		assert!(settings.save(Some(&cache), 1));
+		assert_eq!(persistence(&settings, &view), Persistence::Saving);
+		finish(&mut settings, &mut store);
+		assert!(!settings.state.failed);
+		assert_eq!(persistence(&settings, &view), Persistence::Idle);
+		let stored = store.unwrap().app_preferences().unwrap();
+		assert_eq!(stored.voice_overlay_monitor.as_deref(), Some("DP-2"));
+		assert_eq!(stored.notifications_enabled, view.notifications_enabled);
+
+		view.notifications_enabled = !view.notifications_enabled;
+		settings.observe(&view);
+		assert!(settings.save(Some(&cache), 1));
+		finish(&mut settings, &mut Err(StoreError::Unavailable));
+		assert!(settings.state.failed);
+		assert_eq!(persistence(&settings, &view), Persistence::Idle);
+	}
+
 	#[test]
 	fn minimize_to_tray_results_are_independent_of_account_history() {
 		let safety = HistorySafety::default();

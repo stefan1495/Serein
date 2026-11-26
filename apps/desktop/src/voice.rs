@@ -1075,31 +1075,40 @@ impl Voice {
 	pub(crate) fn overlay_source(
 		&self,
 		state: &State,
-	) -> Option<(crate::speaker_overlay::CallKey, [Id; 64])> {
+	) -> Option<Result<(crate::speaker_overlay::CallKey, [Id; 64]), OverlayPausedAfterMove>> {
 		let live = self.live.as_ref()?;
 		let call = state.voice.active.as_ref()?;
-		if !live.media_ready
-			|| live.negotiation.is_some()
-			|| live.failure.get().is_some()
+		if live.failure.get().is_some()
 			|| live.task.is_finished()
-			|| !matches!(call.phase, Phase::Connected | Phase::Waiting)
+			|| call.phase == Phase::Failed
 			|| !state.can_call(call.channel)
+			|| !state.can_view(call.channel)
 			|| state.user.as_ref().is_none_or(|user| user.id != live.user)
 		{
 			return None;
 		}
-		let (media_epoch, users) = live.speakers.borrow().overlay_sample()?;
-		let key = current_overlay_source(
+		let snapshot = live.speakers.borrow();
+		let key = match current_overlay_source(
 			crate::speaker_overlay::CallKey {
 				generation: live.generation,
 				channel: live.channel,
 				request: live.request,
 				negotiation_revision: live.negotiation_revision,
-				media_epoch,
+				media_epoch: snapshot.overlay.epoch,
 			},
 			(state.generation, call.channel, call.request),
 			live.moved.is_some(),
-		)?;
+		)? {
+			Ok(key) => key,
+			Err(paused) => return Some(Err(paused)),
+		};
+		if !live.media_ready
+			|| live.negotiation.is_some()
+			|| !matches!(call.phase, Phase::Connected | Phase::Waiting)
+		{
+			return None;
+		}
+		let (_, users) = snapshot.overlay_sample()?;
 		let muted = live.controls.borrow().muted;
 		let speakers = users.map(|user| {
 			if muted && user == live.user.0 {
@@ -1108,7 +1117,7 @@ impl Voice {
 				Id(user)
 			}
 		});
-		Some((key, speakers))
+		Some(Ok((key, speakers)))
 	}
 
 	pub fn poll(
@@ -2224,14 +2233,25 @@ impl Voice {
 	}
 }
 #[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OverlayPausedAfterMove;
+
+#[cfg(target_os = "linux")]
 fn current_overlay_source(
 	source: crate::speaker_overlay::CallKey,
 	active: (u64, Id, u64),
 	moved: bool,
-) -> Option<crate::speaker_overlay::CallKey> {
+) -> Option<Result<crate::speaker_overlay::CallKey, OverlayPausedAfterMove>> {
+	if (source.generation, source.channel, source.request) != active {
+		return None;
+	}
 	// `live.channel` can change without restarting media. That worker's untagged
 	// speaker samples are never projected again, even if moved back to the same channel.
-	(!moved && (source.generation, source.channel, source.request) == active).then_some(source)
+	Some(if moved {
+		Err(OverlayPausedAfterMove)
+	} else {
+		Ok(source)
+	})
 }
 
 impl Drop for Voice {
@@ -2455,27 +2475,35 @@ mod tests {
 		};
 		assert_eq!(
 			current_overlay_source(source, (4, Id(10), 9), false),
-			Some(source)
+			Some(Ok(source))
 		);
 		let relabeled = crate::speaker_overlay::CallKey {
 			channel: Id(11),
+			media_epoch: 2,
 			..source
 		};
+		let paused = Some(Err(OverlayPausedAfterMove));
 		assert_eq!(
 			current_overlay_source(relabeled, (4, Id(11), 9), true),
+			paused
+		);
+		assert_eq!(current_overlay_source(source, (4, Id(10), 9), true), paused);
+		assert_eq!(
+			current_overlay_source(relabeled, (4, Id(11), 10), true),
 			None
 		);
-		assert_eq!(current_overlay_source(source, (4, Id(10), 9), true), None);
-		let fresh = crate::speaker_overlay::CallKey {
+		assert_eq!(
+			current_overlay_source(relabeled, (5, Id(11), 9), true),
+			None
+		);
+		let replacement = crate::speaker_overlay::CallKey {
 			negotiation_revision: 6,
 			..relabeled
 		};
 		assert_eq!(
-			current_overlay_source(fresh, (4, Id(11), 9), false),
-			Some(fresh)
+			current_overlay_source(replacement, (4, Id(11), 9), false),
+			Some(Ok(replacement))
 		);
-		assert_eq!(current_overlay_source(fresh, (4, Id(11), 10), false), None);
-		assert_eq!(current_overlay_source(fresh, (5, Id(11), 9), false), None);
 	}
 
 	#[cfg(target_os = "linux")]

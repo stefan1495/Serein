@@ -450,7 +450,7 @@ impl MessagingUi {
 			.filter(move |entry| Some(entry.channel) == call)
 			.chain(rows.iter().filter(move |entry| Some(entry.channel) != call))
 			.filter(|entry| state.can_view(entry.channel));
-		self.voice_roster_rows(state, ordered, &self.voice_speaking)
+		self.voice_roster_rows(state, ordered, &self.voice_speaking, false)
 	}
 
 	fn voice_roster_rows<'a>(
@@ -458,25 +458,30 @@ impl MessagingUi {
 		state: &'a State,
 		rows: impl Iterator<Item = &'a RosterEntry> + 'a,
 		speakers: &'a [Id],
+		speaking_only: bool,
 	) -> impl Iterator<Item = VoiceRosterRow<'a>> + 'a {
 		// Share one lazily built member index across the visible rows.
 		let mut index = None;
-		rows.map(move |entry| {
+		rows.filter_map(move |entry| {
 			let shown = shown_participant(state, entry);
+			let speaking = self.is_speaking_in(state, entry.channel, &shown, speakers);
+			if speaking_only && !speaking {
+				return None;
+			}
 			let member = entry.member.as_ref().or_else(|| {
 				index
 					.get_or_insert_with(|| MemberIndex::build(state))
 					.get(entry.guild, entry.participant.user)
 			});
 			let (user, name) = resolve_member_with(state, member, entry);
-			VoiceRosterRow {
+			Some(VoiceRosterRow {
 				entry,
 				name: user.map(|_| name),
 				#[cfg(target_os = "linux")]
 				user,
-				speaking: self.is_speaking_in(state, entry.channel, &shown, speakers),
+				speaking,
 				shown,
-			}
+			})
 		})
 	}
 
@@ -492,7 +497,7 @@ impl MessagingUi {
 			.voice
 			.active
 			.as_ref()
-			.filter(|call| state.can_view(call.channel));
+			.filter(|call| speakers.iter().any(|id| id.0 != 0) && state.can_view(call.channel));
 		let guild = call
 			.filter(|call| call.guild.is_some())
 			.into_iter()
@@ -502,8 +507,7 @@ impl MessagingUi {
 					.roster
 					.iter()
 					.filter(|entry| entry.channel == call.channel);
-				self.voice_roster_rows(state, rows, speakers)
-					.filter(|row| row.speaking)
+				self.voice_roster_rows(state, rows, speakers, true)
 					.map(|row| (row.shown.user, row.name.unwrap_or("Participant"), row.user))
 			});
 		let private = call
@@ -4342,6 +4346,14 @@ impl MessagingUi {
 			.show(ui, |ui| {
 				ui.set_width(ui.available_width());
 				ui.spacing_mut().item_spacing.y = 8.0;
+				#[cfg(target_os = "linux")]
+				if self.voice_overlay.paused_after_move() {
+					ui.label(
+						RichText::new(self.language.text("voice-overlay-paused-after-move"))
+							.size(12.0)
+							.color(colors.warning),
+					);
+				}
 				if self.voice_microphone_unavailable {
 					ui.label(
 						RichText::new(crate::i18n::translate(
@@ -5454,6 +5466,34 @@ fn user_limit_pill(ui: &egui::Ui, right: egui::Pos2, people: usize, limit: u16) 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn active_voice_speakers_keeps_private_participant_order_and_excludes_ringing_recipients() {
+		let mut state = test_support::call_demo_state();
+		let call = state.voice.active.as_mut().unwrap();
+		call.participants[1].muted = false;
+		let view = MessagingUi::default();
+		let sample = [Id(2), Id(1), Id(0)];
+		assert!(
+			view.active_voice_speakers(&state, &[Id(0); 64])
+				.next()
+				.is_none()
+		);
+		let speakers = |state: &State| {
+			view.active_voice_speakers(state, &sample)
+				.map(|(id, _, user)| (id, user.map(|user| user.id)))
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(
+			speakers(&state),
+			[(Id(1), Some(Id(1))), (Id(2), Some(Id(2)))]
+		);
+
+		// The DM recipient is still known to the client but no longer participating.
+		state.voice.active.as_mut().unwrap().participants.pop();
+		assert_eq!(speakers(&state), [(Id(1), Some(Id(1)))]);
+	}
 
 	#[test]
 	fn profile_join_opens_its_channel_only_once_a_switch_starts_the_join() {

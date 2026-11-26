@@ -16,6 +16,7 @@ pub struct Layout {
 pub struct Display {
 	pub name: String,
 	pub label: String,
+	pub live_supported: bool,
 }
 
 impl Display {
@@ -50,11 +51,24 @@ pub struct Placement {
 	pub mode: Mode,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum Persistence {
+	#[default]
+	Idle,
+	Saving,
+	NotLoaded,
+	Failed {
+		retry: bool,
+	},
+}
+
 #[derive(Default)]
 pub struct Settings {
 	pub enabled: bool,
 	pub saved: Layout,
 	pub fonts: Arc<[String]>,
+	pub paused_after_move: bool,
+	pub persistence: Persistence,
 	availability: Availability,
 	displays: Vec<Display>,
 	draft: Option<Layout>,
@@ -62,9 +76,18 @@ pub struct Settings {
 	generation: u64,
 	dragging: bool,
 	save_requested: bool,
+	retry_requested: bool,
 }
 
 impl Settings {
+	pub fn take_retry_request(&mut self) -> bool {
+		std::mem::take(&mut self.retry_requested)
+	}
+
+	pub(super) fn paused_after_move(&self) -> bool {
+		self.paused_after_move && self.enabled && !self.previewing()
+	}
+
 	fn layout(&self) -> &Layout {
 		self.draft.as_ref().unwrap_or(&self.saved)
 	}
@@ -72,9 +95,11 @@ impl Settings {
 	pub fn set_displays(&mut self, availability: Availability, displays: Vec<Display>) {
 		self.availability = availability;
 		self.displays = displays;
-		if self.placement.as_ref().is_some_and(|placement| {
-			availability != Availability::Available || !self.connected(&placement.monitor)
-		}) {
+		if self
+			.placement
+			.as_ref()
+			.is_some_and(|placement| !self.placement_supported(&placement.monitor))
+		{
 			self.stop_placement();
 		}
 	}
@@ -83,8 +108,21 @@ impl Settings {
 		self.placement.as_ref()
 	}
 
-	pub fn connected(&self, monitor: &str) -> bool {
-		self.displays.iter().any(|display| display.name == monitor)
+	fn display(&self, monitor: &str) -> Option<&Display> {
+		self.displays.iter().find(|display| display.name == monitor)
+	}
+
+	pub fn live_supported(&self, monitor: &str) -> bool {
+		matches!(
+			self.availability,
+			Availability::Available | Availability::EditingUnavailable
+		) && self
+			.display(monitor)
+			.is_some_and(|display| display.live_supported)
+	}
+
+	fn placement_supported(&self, monitor: &str) -> bool {
+		self.availability == Availability::Available && self.live_supported(monitor)
 	}
 
 	fn matches(&self, generation: u64, monitor: &str) -> bool {
@@ -137,10 +175,17 @@ impl Settings {
 
 	fn start(&mut self, mode: Mode) {
 		let layout = self.layout();
-		let Some(monitor) = layout.monitor.clone().filter(|name| self.connected(name)) else {
+		let Some(monitor) = layout
+			.monitor
+			.clone()
+			.filter(|name| self.placement_supported(name))
+		else {
 			return;
 		};
 		let initial = layout.position;
+		if mode == Mode::Preview {
+			self.draft();
+		}
 		self.generation = self.generation.wrapping_add(1);
 		self.dragging = false;
 		self.placement = Some(Placement {
@@ -152,7 +197,7 @@ impl Settings {
 	}
 
 	fn select(&mut self, monitor: String, now: Instant) {
-		if self.layout().monitor.as_ref() != Some(&monitor) {
+		if self.live_supported(&monitor) && self.layout().monitor.as_ref() != Some(&monitor) {
 			self.draft().monitor = Some(monitor);
 			self.start(if self.previewing() {
 				Mode::Preview
@@ -179,12 +224,11 @@ impl Settings {
 
 	fn can_save(&self) -> bool {
 		!self.dragging
-			&& self.availability == Availability::Available
 			&& self
 				.draft
 				.as_ref()
 				.and_then(|draft| draft.monitor.as_deref())
-				.is_some_and(|monitor| self.connected(monitor))
+				.is_some_and(|monitor| self.live_supported(monitor))
 	}
 
 	/// Desktop re-reads the layer's latest drag status before honoring a Save click.
@@ -203,6 +247,21 @@ impl Settings {
 
 	pub(super) fn show(&mut self, ui: &mut egui::Ui, language: Language) {
 		let text = |key| language.text(key);
+		match self.persistence {
+			Persistence::Idle => {}
+			Persistence::Saving => {
+				ui.weak(text("voice-overlay-saving"));
+			}
+			Persistence::NotLoaded => {
+				ui.label(text("voice-overlay-save-not-loaded"));
+			}
+			Persistence::Failed { retry } => {
+				ui.label(text("voice-overlay-save-failed"));
+				if retry && ui.button(text("voice-overlay-retry-save")).clicked() {
+					self.retry_requested = true;
+				}
+			}
+		}
 		if matches!(
 			self.availability,
 			Availability::Starting | Availability::Unavailable
@@ -215,42 +274,49 @@ impl Settings {
 			return;
 		}
 		design::switch(ui, &text("voice-overlay-enable"), None, &mut self.enabled);
+		if self.paused_after_move() {
+			ui.label(text("voice-overlay-paused-after-move"));
+		}
 		if self.availability == Availability::EditingUnavailable {
 			ui.weak(text("voice-overlay-editing-unavailable"));
-			return;
 		}
 		let monitor = self.layout().monitor.as_deref();
-		let connected = monitor.is_some_and(|monitor| self.connected(monitor));
-		if monitor.is_some() && !connected {
+		let display = monitor.and_then(|name| self.display(name));
+		let live_display_available = self.displays.iter().any(|display| display.live_supported);
+		if monitor.is_some() && display.is_none() {
 			ui.weak(text("voice-overlay-disconnected"));
 		}
 		if self.displays.is_empty() {
 			ui.weak(text("voice-overlay-no-displays"));
+		} else if !live_display_available {
+			ui.weak(text("voice-overlay-no-live-displays"));
+		} else if display.is_some_and(|display| !display.live_supported) {
+			ui.weak(text("voice-overlay-display-unavailable"));
 		}
 		ui.label(text("voice-overlay-display"));
 		let caption = monitor.map_or_else(
 			|| text("voice-overlay-no-selection"),
-			|monitor| {
-				self.displays
-					.iter()
-					.find(|display| display.name == monitor)
-					.map_or_else(|| monitor.to_owned(), Display::caption)
-			},
+			|monitor| display.map_or_else(|| monitor.to_owned(), Display::caption),
 		);
 		let mut selected = None;
-		ui.add_enabled_ui(!self.displays.is_empty(), |ui| {
+		ui.add_enabled_ui(live_display_available, |ui| {
 			design::Select::from_id_salt("voice-overlay-display")
 				.selected_text(caption)
 				.width(ui.available_width().min(400.0))
 				.show_ui(ui, |ui| {
 					for display in &self.displays {
-						if ui
-							.selectable_label(
+						let mut row = ui.add_enabled(
+							display.live_supported,
+							egui::Button::selectable(
 								monitor == Some(display.name.as_str()),
 								display.caption(),
-							)
-							.clicked()
-						{
+							),
+						);
+						if !display.live_supported {
+							row = row
+								.on_disabled_hover_text(text("voice-overlay-display-unavailable"));
+						}
+						if row.clicked() {
 							selected = Some(display.name.clone());
 						}
 					}
@@ -260,24 +326,23 @@ impl Settings {
 		if let Some(selected) = selected {
 			self.select(selected, now);
 		}
-		let connected = self
+		let placement_supported = self
 			.layout()
 			.monitor
 			.as_deref()
-			.is_some_and(|name| self.connected(name));
+			.is_some_and(|name| self.placement_supported(name));
 		ui.horizontal_wrapped(|ui| {
-			ui.add_enabled_ui(connected && !self.previewing(), |ui| {
+			ui.add_enabled_ui(placement_supported && !self.previewing(), |ui| {
 				if ui.button(text("voice-overlay-identify")).clicked() {
 					self.start(Self::identify(now));
 				}
 				if ui.button(text("voice-overlay-edit")).clicked() {
-					self.draft();
 					self.start(Mode::Preview);
 				}
 			});
 			if ui
 				.add_enabled(
-					connected && !self.dragging,
+					placement_supported && !self.dragging,
 					egui::Button::new(text("voice-overlay-reset")),
 				)
 				.clicked()
@@ -429,8 +494,34 @@ mod tests {
 			.map(|&name| Display {
 				name: name.into(),
 				label: "Identical displays".into(),
+				live_supported: true,
 			})
 			.collect()
+	}
+
+	#[test]
+	fn live_only_display_draft_saves_without_placement_protocols() {
+		let mut settings = Settings::default();
+		let now = Instant::now();
+		settings.set_displays(Availability::EditingUnavailable, displays(&["DP-1"]));
+		settings.select("DP-1".into(), now);
+		assert!(settings.placement().is_none());
+		settings.start(Settings::identify(now));
+		settings.start(Mode::Preview);
+		assert!(settings.placement().is_none());
+		assert_eq!(settings.saved.monitor, None);
+
+		let mut unsupported = displays(&["DP-1"]);
+		unsupported[0].live_supported = false;
+		settings.set_displays(Availability::EditingUnavailable, unsupported);
+		settings.save_requested = true;
+		assert!(!settings.save_if_requested());
+
+		settings.set_displays(Availability::EditingUnavailable, displays(&["DP-1"]));
+		settings.save_requested = true;
+		assert!(settings.save_if_requested());
+		assert_eq!(settings.saved.monitor.as_deref(), Some("DP-1"));
+		assert!(settings.draft.is_none());
 	}
 
 	#[test]
