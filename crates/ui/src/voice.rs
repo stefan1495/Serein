@@ -34,11 +34,18 @@ pub struct VoiceRosterRow<'a> {
 	pub entry: &'a RosterEntry,
 	/// Display name when the member is loaded.
 	pub name: Option<&'a str>,
-	#[cfg(target_os = "linux")]
-	user: Option<&'a model::User>,
 	/// Mute and deafen flags as shown, including the own call's live state.
 	pub shown: Participant,
 	pub speaking: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub struct OverlayParticipant<'a> {
+	pub shown: Participant,
+	pub name: &'a str,
+	pub user: Option<&'a model::User>,
+	pub speaking: bool,
+	pub locally_muted: bool,
 }
 
 impl MessagingUi {
@@ -450,38 +457,31 @@ impl MessagingUi {
 			.filter(move |entry| Some(entry.channel) == call)
 			.chain(rows.iter().filter(move |entry| Some(entry.channel) != call))
 			.filter(|entry| state.can_view(entry.channel));
-		self.voice_roster_rows(state, ordered, &self.voice_speaking, false)
+		self.voice_roster_rows(state, ordered)
 	}
 
 	fn voice_roster_rows<'a>(
 		&'a self,
 		state: &'a State,
 		rows: impl Iterator<Item = &'a RosterEntry> + 'a,
-		speakers: &'a [Id],
-		speaking_only: bool,
 	) -> impl Iterator<Item = VoiceRosterRow<'a>> + 'a {
 		// Share one lazily built member index across the visible rows.
 		let mut index = None;
-		rows.filter_map(move |entry| {
+		rows.map(move |entry| {
 			let shown = shown_participant(state, entry);
-			let speaking = self.is_speaking_in(state, entry.channel, &shown, speakers);
-			if speaking_only && !speaking {
-				return None;
-			}
+			let speaking = self.is_speaking(state, entry.channel, &shown);
 			let member = entry.member.as_ref().or_else(|| {
 				index
 					.get_or_insert_with(|| MemberIndex::build(state))
 					.get(entry.guild, entry.participant.user)
 			});
 			let (user, name) = resolve_member_with(state, member, entry);
-			Some(VoiceRosterRow {
+			VoiceRosterRow {
 				entry,
 				name: user.map(|_| name),
-				#[cfg(target_os = "linux")]
-				user,
 				speaking,
 				shown,
-			})
+			}
 		})
 	}
 
@@ -489,45 +489,94 @@ impl MessagingUi {
 	/// use call participants rather than showing all recipients or people still ringing.
 	#[cfg(target_os = "linux")]
 	pub fn active_voice_speakers<'a>(
-		&'a self,
+		&self,
 		state: &'a State,
-		speakers: &'a [Id],
-	) -> impl Iterator<Item = (Id, &'a str, Option<&'a model::User>)> + 'a {
-		let call = state
-			.voice
-			.active
-			.as_ref()
-			.filter(|call| speakers.iter().any(|id| id.0 != 0) && state.can_view(call.channel));
-		let guild = call
-			.filter(|call| call.guild.is_some())
-			.into_iter()
-			.flat_map(move |call| {
-				let rows = state
-					.voice
-					.roster
-					.iter()
-					.filter(|entry| entry.channel == call.channel);
-				self.voice_roster_rows(state, rows, speakers, true)
-					.map(|row| (row.shown.user, row.name.unwrap_or("Participant"), row.user))
-			});
-		let private = call
-			.filter(|call| call.guild.is_none())
-			.into_iter()
-			.flat_map(move |call| {
-				call.participants.iter().filter_map(move |participant| {
-					let shown = shown_call_participant(state, call.channel, *participant);
-					if !self.is_speaking_in(state, call.channel, &shown, speakers) {
-						return None;
-					}
+		speakers: &[Id],
+		mode: model::voice_overlay::RosterMode,
+		slots: usize,
+	) -> (Vec<OverlayParticipant<'a>>, usize) {
+		let everyone = mode == model::voice_overlay::RosterMode::Everyone;
+		let Some(call) = state.voice.active.as_ref().filter(|call| {
+			slots > 0
+				&& (everyone || speakers.iter().any(|id| id.0 != 0))
+				&& matches!(call.phase, Phase::Connected | Phase::Waiting)
+				&& state.can_view(call.channel)
+		}) else {
+			return (Vec::new(), 0);
+		};
+		let own = state.user.as_ref().map(|user| user.id);
+		let mut eligible = std::collections::BTreeMap::new();
+		let mut select = |shown: Participant, entry: Option<&'a RosterEntry>| {
+			let locally_muted = self.voice_user_locally_muted(shown.user);
+			let speaking = if everyone {
+				!call.deafened
+					&& !call.server_deafened
+					&& !shown.muted && !shown.deafened
+					&& !shown.server_muted
+					&& !shown.server_deafened
+					&& speakers.contains(&shown.user)
+			} else {
+				self.is_speaking_in(state, call.channel, &shown, speakers)
+			};
+			if shown.user.0 != 0 && (speaking || everyone) {
+				eligible
+					.entry((everyone && own != Some(shown.user), shown.user))
+					.or_insert((shown, entry, speaking, locally_muted));
+			}
+		};
+		if let Some(guild) = call.guild {
+			for entry in state
+				.voice
+				.roster
+				.iter()
+				.filter(|entry| entry.channel == call.channel && entry.guild == guild)
+			{
+				select(shown_participant(state, entry), Some(entry));
+			}
+		} else {
+			for participant in &call.participants {
+				select(
+					shown_call_participant(state, call.channel, *participant),
+					None,
+				);
+			}
+		}
+		let total = eligible.len();
+		let shown = if everyone && total > slots {
+			slots - 1
+		} else {
+			slots.min(total)
+		};
+		let mut index = None;
+		let rows = eligible
+			.into_values()
+			.take(shown)
+			.map(|(shown, entry, speaking, locally_muted)| {
+				let (user, name) = if let Some(entry) = entry {
+					let member = entry
+						.member
+						.as_ref()
+						.filter(|member| member.user.id == shown.user)
+						.or_else(|| {
+							index
+								.get_or_insert_with(|| MemberIndex::build(state))
+								.get(entry.guild, shown.user)
+						});
+					resolve_member_with(state, member, entry)
+				} else {
 					let user = participant_user(state, call.channel, shown.user);
-					Some((
-						shown.user,
-						user.map_or("Participant", |user| user.name.as_str()),
-						user,
-					))
-				})
-			});
-		guild.chain(private)
+					(user, user.map_or("", |user| user.name.as_str()))
+				};
+				OverlayParticipant {
+					shown,
+					name: if user.is_some() { name } else { "" },
+					user,
+					speaking,
+					locally_muted,
+				}
+			})
+			.collect();
+		(rows, if everyone { total - shown } else { 0 })
 	}
 
 	pub(super) fn voice_channel_button(
@@ -5476,13 +5525,15 @@ mod tests {
 		let view = MessagingUi::default();
 		let sample = [Id(2), Id(1), Id(0)];
 		assert!(
-			view.active_voice_speakers(&state, &[Id(0); 64])
-				.next()
-				.is_none()
+			view.active_voice_speakers(&state, &[Id(0); 64], Default::default(), 8)
+				.0
+				.is_empty()
 		);
 		let speakers = |state: &State| {
-			view.active_voice_speakers(state, &sample)
-				.map(|(id, _, user)| (id, user.map(|user| user.id)))
+			view.active_voice_speakers(state, &sample, Default::default(), 8)
+				.0
+				.into_iter()
+				.map(|row| (row.shown.user, row.user.map(|user| user.id)))
 				.collect::<Vec<_>>()
 		};
 		assert_eq!(
@@ -5491,8 +5542,68 @@ mod tests {
 		);
 
 		// The DM recipient is still known to the client but no longer participating.
-		state.voice.active.as_mut().unwrap().participants.pop();
+		let everyone = model::voice_overlay::RosterMode::Everyone;
+		let participant = state
+			.voice
+			.active
+			.as_mut()
+			.unwrap()
+			.participants
+			.pop()
+			.unwrap();
 		assert_eq!(speakers(&state), [(Id(1), Some(Id(1)))]);
+		assert!(
+			view.active_voice_speakers(&state, &sample, everyone, 8)
+				.0
+				.iter()
+				.all(|row| row.shown.user != participant.user)
+		);
+
+		let mut view = view;
+		view.set_voice_user_mutes(&[participant.user.0]);
+		let call = state.voice.active.as_mut().unwrap();
+		let self_row = call.participants[0];
+		call.participants = vec![
+			participant,
+			Participant {
+				user: Id(99),
+				server_deafened: true,
+				..participant
+			},
+			participant,
+			self_row,
+		];
+		let (rows, hidden) = view.active_voice_speakers(&state, &sample, everyone, 3);
+		assert_eq!(
+			hidden, 0,
+			"duplicate participants do not count toward overflow"
+		);
+		assert_eq!(rows[0].shown.user, Id(1));
+		assert!(rows[1].speaking && rows[1].locally_muted && !rows[1].shown.muted);
+		assert!(rows[2].shown.server_deafened && !rows[2].speaking && rows[2].name.is_empty());
+		let (rows, hidden) = view.active_voice_speakers(&state, &[], everyone, 2);
+		assert_eq!(
+			(rows.len(), rows[0].shown.user, rows[0].speaking, hidden),
+			(1, Id(1), false, 2)
+		);
+		state.voice.active.as_mut().unwrap().deafened = true;
+		assert!(
+			view.active_voice_speakers(&state, &sample, everyone, 8)
+				.0
+				.iter()
+				.all(|row| !row.speaking)
+		);
+		assert!(
+			view.active_voice_speakers(&state, &sample, Default::default(), 8)
+				.0
+				.is_empty()
+		);
+		state.voice.active.as_mut().unwrap().channel = Id(999);
+		assert!(
+			view.active_voice_speakers(&state, &sample, everyone, 8)
+				.0
+				.is_empty()
+		);
 	}
 
 	#[test]

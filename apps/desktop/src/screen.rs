@@ -594,7 +594,7 @@ impl Screen {
 					Status::WaitingForPeer => "Screen preview · waiting for others",
 					Status::Ready { .. } => "Sharing your screen",
 					Status::RemoteAudio
-					| Status::Speaking(_)
+					| Status::Speaking(..)
 					| Status::CameraAvailable(_)
 					| Status::Latency(_) => {
 						return Ok(());

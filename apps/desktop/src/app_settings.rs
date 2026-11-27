@@ -15,10 +15,19 @@ pub struct Settings {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(crate) enum OverlaySection {
+	Layout,
+	Voice,
+	Notifications,
+}
+
+#[cfg(target_os = "linux")]
 #[derive(PartialEq, Eq)]
 pub(crate) struct OverlayPreferences {
 	enabled: bool,
 	layout: ui::voice_overlay::Layout,
+	notifications: model::voice_overlay::NotificationSettings,
 }
 
 #[cfg(target_os = "linux")]
@@ -26,16 +35,36 @@ impl OverlayPreferences {
 	fn from_preferences(value: &AppPreferences) -> Self {
 		Self {
 			enabled: value.voice_overlay_enabled(),
+			notifications: value.overlay_notifications,
 			layout: ui::voice_overlay::Layout {
 				monitor: value.voice_overlay_monitor.clone(),
 				position: value.voice_overlay_position,
 				appearance: value.voice_overlay_appearance.clone(),
+				roster: value.voice_overlay_roster,
 			},
 		}
 	}
 
-	fn matches(&self, overlay: &ui::voice_overlay::Settings) -> bool {
-		self.enabled == overlay.enabled && self.layout == overlay.saved
+	fn matches(&self, ui: &ui::MessagingUi, section: OverlaySection) -> bool {
+		let voice = &ui.voice_overlay;
+		let notifications = ui.overlay_notifications.saved;
+		match section {
+			OverlaySection::Layout => {
+				self.layout.monitor == voice.saved.monitor
+					&& self.layout.position == voice.saved.position
+					&& self.notifications.position == notifications.position
+					&& self.notifications.corner == notifications.corner
+			}
+			OverlaySection::Voice => {
+				self.enabled == voice.enabled
+					&& self.layout.appearance == voice.saved.appearance
+					&& self.layout.roster == voice.saved.roster
+			}
+			OverlaySection::Notifications => {
+				self.notifications.enabled == notifications.enabled
+					&& self.notifications.include_excerpts == notifications.include_excerpts
+			}
+		}
 	}
 }
 
@@ -99,27 +128,24 @@ impl Settings {
 	#[cfg(target_os = "linux")]
 	pub fn overlay_persistence(
 		&self,
-		overlay: &ui::voice_overlay::Settings,
+		ui: &ui::MessagingUi,
+		section: OverlaySection,
 		cache_available: bool,
 	) -> ui::voice_overlay::Persistence {
 		use ui::voice_overlay::Persistence;
 		let Some(persisted) = &self.persisted_overlay else {
 			return Persistence::NotLoaded;
 		};
-		// An older accepted write can still replace the on-disk layout after a user reverts.
-		if persisted.matches(overlay)
-			&& self
-				.overlay_in_flight
-				.as_ref()
-				.is_none_or(|value| value == persisted)
-		{
+		let matches = |value: &OverlayPreferences| value.matches(ui, section);
+		// An older accepted write can still change the on-disk setting after a revert.
+		if matches(persisted) && self.overlay_in_flight.as_ref().is_none_or(matches) {
 			return Persistence::Idle;
 		}
 		if self.state.failed {
 			return Persistence::Failed {
 				retry: cache_available
 					&& !self.state.saving
-					&& OverlayPreferences::from_preferences(&self.current).matches(overlay),
+					&& matches(&OverlayPreferences::from_preferences(&self.current)),
 			};
 		}
 		Persistence::Saving
@@ -128,10 +154,11 @@ impl Settings {
 	#[cfg(target_os = "linux")]
 	pub fn retry_overlay_save(
 		&mut self,
-		overlay: &ui::voice_overlay::Settings,
+		ui: &ui::MessagingUi,
+		section: OverlaySection,
 		cache_available: bool,
 	) {
-		if self.overlay_persistence(overlay, cache_available)
+		if self.overlay_persistence(ui, section, cache_available)
 			== (ui::voice_overlay::Persistence::Failed { retry: true })
 		{
 			self.state.dirty = true;
@@ -198,6 +225,14 @@ impl Settings {
 			voice_overlay_appearance: ui.voice_overlay.saved.appearance.clone(),
 			#[cfg(not(target_os = "linux"))]
 			voice_overlay_appearance: self.current.voice_overlay_appearance.clone(),
+			#[cfg(target_os = "linux")]
+			voice_overlay_roster: ui.voice_overlay.saved.roster,
+			#[cfg(not(target_os = "linux"))]
+			voice_overlay_roster: self.current.voice_overlay_roster,
+			#[cfg(target_os = "linux")]
+			overlay_notifications: ui.overlay_notifications.saved,
+			#[cfg(not(target_os = "linux"))]
+			overlay_notifications: self.current.overlay_notifications,
 			input_percent: ui.voice_gain.input_percent,
 			output_percent: ui.voice_gain.output_percent,
 			keybinds: ui.keybinds.clone(),
@@ -260,6 +295,8 @@ impl Settings {
 		#[cfg(target_os = "linux")]
 		{
 			ui.voice_overlay.enabled = value.voice_overlay_enabled();
+			ui.voice_overlay.saved.roster = value.voice_overlay_roster;
+			ui.overlay_notifications.saved = value.overlay_notifications;
 			ui.voice_overlay
 				.saved
 				.monitor
@@ -892,14 +929,56 @@ mod tests {
 		ui.voice_overlay.saved.monitor = Some("DP-1".into());
 		settings.observe(&ui);
 		assert_eq!(
-			settings.overlay_persistence(&ui.voice_overlay, true),
+			settings.overlay_persistence(&ui, OverlaySection::Layout, true),
 			ui::voice_overlay::Persistence::NotLoaded,
 		);
 		let store = local_store::LocalStore::open(std::path::Path::new(":memory:")).unwrap();
 		let cache = crate::cache::Cache::start(eframe::egui::Context::default(), Some(store));
-		settings.retry_overlay_save(&ui.voice_overlay, true);
+		settings.retry_overlay_save(&ui, OverlaySection::Layout, true);
 		assert!(!settings.save(Some(&cache), 1));
 		assert!(settings.state.failed);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn paired_layout_failure_retries_the_latest_committed_pair_not_the_in_flight_pair() {
+		use model::voice_overlay::Position;
+		use ui::voice_overlay::Persistence;
+		let mut settings = Settings::from_preferences(Ok(AppPreferences::default()));
+		let mut ui = ui::MessagingUi::default();
+		settings.apply(&mut ui);
+		let first = Some(Position { x: 1000, y: 2000 });
+		let second = Some(Position { x: 3000, y: 4000 });
+		ui.voice_overlay.saved.monitor = Some("DP-1".into());
+		ui.voice_overlay.saved.position = first;
+		ui.overlay_notifications.saved.position = second;
+		settings.observe(&ui);
+		settings.save_attempted(true);
+		ui.voice_overlay.saved.position = second;
+		ui.overlay_notifications.saved.position = first;
+		settings.observe(&ui);
+		settings.save_completed(false);
+		assert_eq!(
+			settings.overlay_persistence(&ui, OverlaySection::Layout, true),
+			Persistence::Failed { retry: true }
+		);
+		assert_eq!(
+			settings.overlay_persistence(&ui, OverlaySection::Notifications, true),
+			Persistence::Idle
+		);
+		settings.retry_overlay_save(&ui, OverlaySection::Layout, true);
+		assert!(settings.state.dirty);
+		settings.save_attempted(true);
+		settings.save_completed(true);
+		assert_eq!(
+			settings.overlay_persistence(&ui, OverlaySection::Layout, true),
+			Persistence::Idle
+		);
+		let persisted = settings.persisted_overlay.unwrap();
+		assert_eq!(
+			(persisted.layout.position, persisted.notifications.position),
+			(second, first)
+		);
 	}
 
 	#[cfg(target_os = "linux")]

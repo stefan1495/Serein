@@ -524,7 +524,7 @@ impl Watch {
 						Status::WaitingForPeer => "Waiting for the streamer…",
 						Status::Ready { .. } => "Stream secured · waiting for video",
 						Status::RemoteAudio
-						| Status::Speaking(_)
+						| Status::Speaking(..)
 						| Status::CameraAvailable(_)
 						| Status::Latency(_) => {
 							return Ok(());

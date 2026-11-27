@@ -2145,3 +2145,25 @@ no hardware decoder is installed. Real calls and streams were not run: the strea
 come from the synthetic source only, and stream and camera pictures are still copied on
 every platform. Package size was not measured. `video::gst::tests::native_mov_decodes_audio_video_and_seeks` fails
 on the Asahi machine ("no frame after seek") with and without this change.
+
+## Unified KDE Overlay editor
+
+Linux x86-64, pinned Rust 1.99.1, `cargo xtask package` (Debian, release, no default
+features, voice included). The baseline was commit `27260843` plus the pre-existing staged
+changes (tree `1577dc8e`), built in a separate source and output directory. Both packages passed
+the packaging smoke check.
+
+| Metric | Baseline | Unified editor | Delta |
+| --- | ---: | ---: | ---: |
+| Release executable | 107,374,704 bytes | 107,450,352 bytes | +75,648 bytes (+0.070%) |
+| Installed package (`Installed-Size`) | 109,680 KiB | 109,753 KiB | +73 KiB (+0.067%) |
+| Compressed Debian package | 57,062,052 bytes | 57,090,796 bytes | +28,744 bytes (+0.050%) |
+
+A diagnostic idle sample used the native `--demo` Settings window at 1120×760, scale 1, Vulkan,
+KWin virtual output, Ryzen 7 9800X3D and 30 GiB RAM. After a 3-second warmup and one Settings
+window capture, ten samples at 0.5-second intervals read the application PID's CPU ticks and
+resident pages from `/proc/<pid>/stat`, excluding the compositor and screenshot helper. The old
+Voice Overlay page went from 323 MiB peak RSS to 310 MiB settled RSS (9.4% of one core); the new
+Overlay page measured 306 MiB peak and settled RSS (0.0% at this resolution). One short run per
+page cannot separate startup and scheduler noise from UI cost. No idle improvement, live-overlay
+cost, frame-time percentile, or startup regression is inferred from these samples.

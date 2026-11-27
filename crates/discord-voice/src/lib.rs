@@ -46,6 +46,7 @@ pub struct Controls {
 	pub camera: u64,
 	pub camera_rate: model::voice_settings::CameraFrameRate,
 	pub deafened: bool,
+	pub activity_revision: ActivityRevision,
 	/// Session-only playback percentages (0–200); zero user IDs are unused.
 	pub user_volumes: [(u64, u16); 64],
 	/// Watched stream playback percentage, independently muted with zero.
@@ -59,11 +60,19 @@ impl Default for Controls {
 			camera: 0,
 			camera_rate: model::voice_settings::CameraFrameRate::default(),
 			deafened: false,
+			activity_revision: ActivityRevision::default(),
 			user_volumes: [(0, 100); 64],
 			stream_volume: 100,
 		}
 	}
 }
+/// Presentation-only generations shared by the control watch and the speaking producer.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActivityRevision {
+	pub deafen: u64,
+	pub microphone: u64,
+}
+
 pub enum Status {
 	Connecting,
 	Discovering,
@@ -78,7 +87,7 @@ pub enum Status {
 	/// Round trip on the call's signaling socket. Cleared when the socket is replaced.
 	Latency(Option<std::time::Duration>),
 	/// Latest active user IDs, zero-padded to the 64-participant limit.
-	Speaking(Box<[u64; 64]>),
+	Speaking(Box<[u64; 64]>, ActivityRevision),
 }
 
 #[cfg(test)]

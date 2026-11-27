@@ -939,6 +939,83 @@ async fn detectable<A: Applications>(service: &A) -> Option<Vec<Game>> {
 	Some(games)
 }
 
+/// The notification gate never starts the sharing worker or fetches its own catalog.
+#[cfg(target_os = "linux")]
+pub(crate) fn local_game_index() -> Index {
+	Index::new(&list_path().and_then(read_list).unwrap_or_default())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn recognizes_foreground_executable(
+	catalog: Option<&Index>,
+	registered: &[RegisteredGame],
+	executable: &str,
+) -> bool {
+	// Only the live compositor PID's readable executable qualifies, not a process name,
+	// window title, RPC activity or a launcher running a different process in the background.
+	if !executable.starts_with('/') || executable.ends_with(" (deleted)") {
+		return false;
+	}
+	let Some(path) = discord_api::detectable::normalize(executable) else {
+		return false;
+	};
+	if let Some(game) = registered.iter().find(|game| game.executable == path) {
+		return !game.hidden;
+	}
+	catalog
+		.and_then(|games| games.find(executable))
+		.is_some_and(|(id, _)| {
+			!registered.iter().any(|game| {
+				game.hidden
+					&& (game.application == Some(id)
+						|| path.rsplit('/').next() == Some(game.executable.as_str()))
+			})
+		})
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn foreground_recognition_requires_the_actual_executable_and_honors_hidden_games() {
+	let mut registered = [RegisteredGame {
+		executable: "games/fixture/bin/game".into(),
+		name: "Fixture Game".into(),
+		application: Some(Id(42)),
+		hidden: false,
+		last_played: None,
+	}];
+	let catalog = Index::new(&[Game {
+		id: Id(42),
+		name: "Fixture Game".into(),
+		executables: vec!["fixture/bin/game".into()],
+	}]);
+	assert!(recognizes_foreground_executable(
+		None,
+		&registered,
+		"/games/fixture/bin/game"
+	));
+	assert!(!recognizes_foreground_executable(
+		Some(&catalog),
+		&registered,
+		"game"
+	));
+	assert!(!recognizes_foreground_executable(
+		Some(&catalog),
+		&registered,
+		"/games/steam"
+	));
+	assert!(recognizes_foreground_executable(
+		Some(&catalog),
+		&registered,
+		"/opt/fixture/bin/game"
+	));
+	registered[0].hidden = true;
+	assert!(!recognizes_foreground_executable(
+		Some(&catalog),
+		&registered,
+		"/opt/fixture/bin/game"
+	));
+}
+
 fn read_list(path: PathBuf) -> Option<Vec<Game>> {
 	let metadata = std::fs::metadata(&path).ok()?;
 	(metadata.len() <= MAX_CACHED_LIST).then_some(())?;

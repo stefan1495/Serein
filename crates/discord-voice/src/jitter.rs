@@ -1,8 +1,9 @@
 //! Fixed 40ms startup with a bounded reorder window for 2.5?120ms Opus packets.
 const SLOTS: usize = 8;
+type Packet = (Vec<u8>, Option<u64>);
 #[derive(Default)]
 pub(crate) struct Jitter {
-	packets: Vec<(u16, Vec<u8>)>,
+	packets: Vec<(u16, Packet)>,
 	next: Option<u16>,
 	wait: u8,
 	missing: u8,
@@ -11,7 +12,7 @@ impl Jitter {
 	pub fn clear(&mut self) {
 		*self = Self::default();
 	}
-	pub fn push(&mut self, sequence: u16, opus: Vec<u8>) {
+	pub fn push(&mut self, sequence: u16, opus: Vec<u8>, revision: u64) {
 		if opus.len() > 1275 {
 			return;
 		}
@@ -30,11 +31,11 @@ impl Jitter {
 			self.missing = 0;
 		}
 		if self.packets.len() < SLOTS && !self.packets.iter().any(|(id, _)| *id == sequence) {
-			self.packets.push((sequence, opus));
+			self.packets.push((sequence, (opus, Some(revision))));
 		}
 	}
 	/// An empty packet requests Opus packet-loss concealment, at most three consecutive packets.
-	pub fn pop(&mut self) -> Option<Vec<u8>> {
+	pub fn pop(&mut self) -> Option<Packet> {
 		if self.wait > 0 {
 			// Short packets can fill the fixed window before 40ms. Start before
 			// the next arrival would repeatedly reset a full window.
@@ -66,7 +67,7 @@ impl Jitter {
 			self.clear();
 			return None;
 		}
-		Some(Vec::new())
+		Some((Vec::new(), None))
 	}
 }
 #[cfg(test)]
@@ -76,51 +77,51 @@ mod tests {
 	fn burst_loss_preserves_buffered_recovery_and_resets_on_far_jump() {
 		for first in [0u16, u16::MAX - 2] {
 			let mut jitter = Jitter::default();
-			jitter.push(first, vec![0]);
+			jitter.push(first, vec![0], 0);
 			for offset in [7, 5, 6] {
-				jitter.push(first.wrapping_add(offset), vec![offset as u8]);
+				jitter.push(first.wrapping_add(offset), vec![offset as u8], 0);
 			}
 			assert!(jitter.pop().is_none());
 			assert!(jitter.pop().is_none());
-			assert_eq!(jitter.pop(), Some(vec![0]));
+			assert_eq!(jitter.pop(), Some((vec![0], Some(0))));
 			for _ in 0..3 {
-				assert_eq!(jitter.pop(), Some(vec![]));
+				assert_eq!(jitter.pop(), Some((vec![], None)));
 			}
 			for offset in [5, 6, 7] {
-				assert_eq!(jitter.pop(), Some(vec![offset]));
+				assert_eq!(jitter.pop(), Some((vec![offset], Some(0))));
 			}
 			for _ in 0..2 {
-				assert_eq!(jitter.pop(), Some(vec![]));
+				assert_eq!(jitter.pop(), Some((vec![], None)));
 			}
-			jitter.push(first.wrapping_add(100), vec![100]);
+			jitter.push(first.wrapping_add(100), vec![100], 0);
 			assert_eq!(jitter.missing, 0);
 			assert!(jitter.pop().is_none());
 			assert!(jitter.pop().is_none());
-			assert_eq!(jitter.pop(), Some(vec![100]));
+			assert_eq!(jitter.pop(), Some((vec![100], Some(0))));
 		}
 	}
 	#[test]
 	fn bounded_reordering_loss_duplicates_and_wrap() {
 		let mut jitter = Jitter::default();
-		jitter.push(u16::MAX, vec![1]);
-		jitter.push(1, vec![3]);
-		jitter.push(0, vec![2]);
-		jitter.push(0, vec![9]);
+		jitter.push(u16::MAX, vec![1], 0);
+		jitter.push(1, vec![3], 0);
+		jitter.push(0, vec![2], 0);
+		jitter.push(0, vec![9], 0);
 		assert!(jitter.pop().is_none());
 		assert!(jitter.pop().is_none());
-		assert_eq!(jitter.pop(), Some(vec![1]));
-		assert_eq!(jitter.pop(), Some(vec![2]));
-		assert_eq!(jitter.pop(), Some(vec![3]));
+		assert_eq!(jitter.pop(), Some((vec![1], Some(0))));
+		assert_eq!(jitter.pop(), Some((vec![2], Some(0))));
+		assert_eq!(jitter.pop(), Some((vec![3], Some(0))));
 		for _ in 0..3 {
-			assert_eq!(jitter.pop(), Some(vec![]));
+			assert_eq!(jitter.pop(), Some((vec![], None)));
 		}
 		assert!(jitter.pop().is_none());
 		assert!(jitter.pop().is_none());
 		for sequence in 0..1000 {
-			jitter.push(sequence, vec![1; 1275]);
+			jitter.push(sequence, vec![1; 1275], 0);
 			assert!(jitter.packets.len() <= SLOTS);
 		}
-		jitter.push(1000, vec![0; 1276]);
+		jitter.push(1000, vec![0; 1276], 0);
 		assert!(jitter.packets.len() <= SLOTS);
 	}
 }

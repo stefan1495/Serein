@@ -103,6 +103,7 @@ impl Scope {
 #[derive(Default)]
 pub struct ReadState {
 	pub(crate) activity: crate::notifications::Activity,
+	pub(crate) notification_excerpts: bool,
 	entries: BTreeMap<Id, (Option<Id>, u64)>,
 	known: bool,
 	version: Option<u64>,
@@ -132,6 +133,7 @@ impl ReadState {
 	pub fn reset(&mut self) {
 		*self = Self {
 			revision: self.revision.wrapping_add(1),
+			notification_excerpts: self.notification_excerpts,
 			..Self::default()
 		};
 	}

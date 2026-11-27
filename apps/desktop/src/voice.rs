@@ -167,6 +167,8 @@ struct Live {
 	identity: Arc<discord_voice::Identity>,
 	audio: Audio,
 	controls: watch::Sender<Controls>,
+	#[cfg(target_os = "linux")]
+	overlay_deafen: (bool, bool),
 	events: mpsc::Receiver<Notice>,
 	// Terminal errors must survive a full progress queue; retain the first safe reason.
 	failure: Arc<OnceLock<&'static str>>,
@@ -184,6 +186,9 @@ struct Live {
 	stream_audio: mpsc::SyncSender<discord_voice::PlaybackFrame>,
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) type OverlayCall = (crate::speaker_overlay::CallKey, Option<[Id; 64]>);
+
 struct SpeakerSnapshot {
 	users: [u64; 64],
 	#[cfg(target_os = "linux")]
@@ -199,24 +204,38 @@ impl SpeakerSnapshot {
 		}
 	}
 
-	fn replace(&mut self, users: [u64; 64]) {
+	fn replace(&mut self, users: [u64; 64], _revision: discord_voice::ActivityRevision) {
 		self.users = users;
 		#[cfg(target_os = "linux")]
 		{
 			self.overlay.has_sample = self.overlay.ready;
+			self.overlay.revision = _revision;
 		}
 	}
 
 	#[cfg(target_os = "linux")]
-	fn overlay_sample(&self) -> Option<(u64, [u64; 64])> {
-		self.overlay.ready.then(|| {
-			let users = if self.overlay.has_sample {
-				self.users
-			} else {
-				[0; 64]
-			};
-			(self.overlay.epoch, users)
-		})
+	fn overlay_sample(
+		&self,
+		revision: discord_voice::ActivityRevision,
+		own: Id,
+		muted: bool,
+	) -> Option<(u64, Option<[u64; 64]>)> {
+		self.overlay.ready.then_some((
+			self.overlay.epoch,
+			(self.overlay.has_sample && self.overlay.revision.deafen == revision.deafen).then(
+				|| {
+					self.users.map(|id| {
+						if id == own.0
+							&& (muted || self.overlay.revision.microphone != revision.microphone)
+						{
+							0
+						} else {
+							id
+						}
+					})
+				},
+			),
+		))
 	}
 }
 
@@ -227,6 +246,7 @@ struct OverlaySpeakerEpoch {
 	epoch: u64,
 	ready: bool,
 	has_sample: bool,
+	revision: discord_voice::ActivityRevision,
 }
 
 #[cfg(target_os = "linux")]
@@ -1072,10 +1092,38 @@ impl Voice {
 		}
 	}
 	#[cfg(target_os = "linux")]
+	pub(crate) fn observe_overlay_deafen(&mut self, state: &State, local: Option<(Id, u64, bool)>) {
+		let (Some(live), Some(call)) = (&mut self.live, &state.voice.active) else {
+			return;
+		};
+		if (live.generation, live.channel, live.request)
+			!= (state.generation, call.channel, call.request)
+		{
+			return;
+		}
+		let deafened = match local {
+			Some((channel, request, deafened))
+				if (channel, request) == (call.channel, call.request) =>
+			{
+				deafened
+			}
+			Some(_) => return,
+			None => call.deafened,
+		};
+		let flags = (deafened, call.server_deafened);
+		if live.overlay_deafen != flags {
+			live.overlay_deafen = flags;
+			live.controls.send_modify(|control| {
+				control.activity_revision.deafen = control.activity_revision.deafen.wrapping_add(1);
+			});
+		}
+	}
+
+	#[cfg(target_os = "linux")]
 	pub(crate) fn overlay_source(
 		&self,
 		state: &State,
-	) -> Option<Result<(crate::speaker_overlay::CallKey, [Id; 64]), OverlayPausedAfterMove>> {
+	) -> Option<Result<OverlayCall, OverlayPausedAfterMove>> {
 		let live = self.live.as_ref()?;
 		let call = state.voice.active.as_ref()?;
 		if live.failure.get().is_some()
@@ -1108,15 +1156,12 @@ impl Voice {
 		{
 			return None;
 		}
-		let (_, users) = snapshot.overlay_sample()?;
-		let muted = live.controls.borrow().muted;
-		let speakers = users.map(|user| {
-			if muted && user == live.user.0 {
-				Id(0)
-			} else {
-				Id(user)
-			}
-		});
+		let controls = live.controls.borrow();
+		let (_, users) =
+			snapshot.overlay_sample(controls.activity_revision, live.user, controls.muted)?;
+		let speakers = users
+			.filter(|_| !call.deafened && !call.server_deafened)
+			.map(|users| users.map(Id));
 		Some(Ok((key, speakers)))
 	}
 
@@ -1310,6 +1355,8 @@ impl Voice {
 		if self.pending.is_some() && self.retiring.is_some() {
 			ctx.request_repaint_after(Duration::from_millis(50));
 		}
+		#[cfg(target_os = "linux")]
+		self.observe_overlay_deafen(state, None);
 		let mut failure = None;
 		let mut command = None;
 		if let Some(live) = &mut self.live {
@@ -1345,6 +1392,11 @@ impl Voice {
 				{
 					false
 				} else {
+					#[cfg(target_os = "linux")]
+					if control.muted != muted {
+						control.activity_revision.microphone =
+							control.activity_revision.microphone.wrapping_add(1);
+					}
 					control.muted = muted;
 					control.deafened = deafened;
 					control.user_volumes = user_volumes;
@@ -2082,6 +2134,7 @@ impl Voice {
 			camera: 0,
 			camera_rate: ui.voice_camera_rate,
 			deafened: false,
+			activity_revision: discord_voice::ActivityRevision::default(),
 			user_volumes: ui.voice_user_volumes(),
 			stream_volume: ui.voice_stream_volume(),
 		});
@@ -2180,8 +2233,8 @@ impl Voice {
 							status_wake.request_repaint();
 							return Ok(());
 						}
-						Status::Speaking(users) => {
-							speaking.send_modify(|sample| sample.replace(*users));
+						Status::Speaking(users, revision) => {
+							speaking.send_modify(|sample| sample.replace(*users, revision));
 							status_wake.request_repaint();
 							return Ok(());
 						}
@@ -2213,6 +2266,8 @@ impl Voice {
 			cues: CallCues::default(),
 			audio,
 			controls,
+			#[cfg(target_os = "linux")]
+			overlay_deafen: (false, false),
 			events,
 			failure,
 			speakers,
@@ -2509,26 +2564,51 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn overlay_resecuring_rejects_speech_until_a_ready_epoch_sample() {
+		let revision = discord_voice::ActivityRevision::default();
 		let mut sample = SpeakerSnapshot::new();
 		let mut speakers = [0; 64];
 		speakers[0] = 42;
 		sample.overlay.ready = true;
-		sample.replace(speakers);
-		let (epoch, current) = sample.overlay_sample().unwrap();
-		assert_eq!(current[0], 42);
+		sample.replace(speakers, revision);
+		let (epoch, current) = sample.overlay_sample(revision, Id(42), false).unwrap();
+		assert_eq!(current.unwrap()[0], 42);
 
 		sample.overlay.secure();
-		assert!(sample.overlay_sample().is_none());
-		sample.replace(speakers); // An update before Ready must not reappear afterward.
+		assert!(sample.overlay_sample(revision, Id(42), false).is_none());
+		sample.replace(speakers, revision); // An update before Ready must not reappear afterward.
 		sample.overlay.ready = true;
-		let (resumed_epoch, current) = sample.overlay_sample().unwrap();
+		let (resumed_epoch, current) = sample.overlay_sample(revision, Id(42), false).unwrap();
 		assert_ne!(resumed_epoch, epoch);
 		assert_eq!(sample.users[0], 42); // Independent existing indicator unchanged.
-		assert!(!current.contains(&42));
+		assert_eq!(current, None);
 
 		speakers[0] = 77;
-		sample.replace(speakers);
-		assert_eq!(sample.overlay_sample(), Some((resumed_epoch, speakers)));
+		sample.replace(speakers, revision);
+		assert_eq!(
+			sample.overlay_sample(revision, Id(42), false),
+			Some((resumed_epoch, Some(speakers)))
+		);
+		let changed = discord_voice::ActivityRevision {
+			deafen: 2,
+			microphone: 0,
+		};
+		assert_eq!(
+			sample.overlay_sample(changed, Id(77), false),
+			Some((resumed_epoch, None))
+		);
+		sample.replace(speakers, changed);
+		assert_eq!(
+			sample.overlay_sample(changed, Id(77), false),
+			Some((resumed_epoch, Some(speakers)))
+		);
+		let mic = discord_voice::ActivityRevision {
+			microphone: 2,
+			..changed
+		};
+		assert_eq!(
+			sample.overlay_sample(mic, Id(77), false),
+			Some((resumed_epoch, Some([0; 64])))
+		);
 	}
 
 	#[test]
@@ -3356,6 +3436,8 @@ mod tests {
 			identity: discord_voice::Identity::generate(),
 			audio,
 			controls,
+			#[cfg(target_os = "linux")]
+			overlay_deafen: (false, false),
 			events,
 			failure: Arc::new(OnceLock::new()),
 			speakers,

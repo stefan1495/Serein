@@ -29,7 +29,7 @@ enum Page {
 	/// Discord's Registered Games: activity sharing, the current game and Added Games.
 	Activity,
 	Voice,
-	VoiceOverlay,
+	Overlay,
 	Keybinds,
 	/// Display language and clock style.
 	LanguageTime,
@@ -49,7 +49,7 @@ impl Page {
 		Self::Chat,
 		Self::Notifications,
 		Self::Voice,
-		Self::VoiceOverlay,
+		Self::Overlay,
 		Self::Keybinds,
 		Self::Activity,
 		Self::LanguageTime,
@@ -77,7 +77,7 @@ impl Page {
 				Self::Chat,
 				Self::Notifications,
 				Self::Voice,
-				Self::VoiceOverlay,
+				Self::Overlay,
 				Self::Keybinds,
 				Self::Activity,
 				Self::LanguageTime,
@@ -92,13 +92,12 @@ impl Page {
 	fn signed_out(self) -> bool {
 		matches!(
 			self,
-			Self::Appearance | Self::LanguageTime | Self::General | Self::Updates
+			Self::Appearance | Self::LanguageTime | Self::General | Self::Updates | Self::Overlay
 		)
 	}
 	/// Whether the page is offered: every page when signed in, the few above when not.
 	fn offered(self, signed_out: bool) -> bool {
-		(cfg!(target_os = "linux") || self != Self::VoiceOverlay)
-			&& (!signed_out || self.signed_out())
+		(cfg!(target_os = "linux") || self != Self::Overlay) && (!signed_out || self.signed_out())
 	}
 	fn label_key(self) -> &'static str {
 		match self {
@@ -112,7 +111,7 @@ impl Page {
 			Self::Notifications => "page-notifications",
 			Self::Activity => "page-registered-games",
 			Self::Voice => "page-voice",
-			Self::VoiceOverlay => "page-voice-overlay",
+			Self::Overlay => "page-overlay",
 			Self::Keybinds => "page-keybinds",
 			Self::Storage => "page-storage",
 			Self::Updates => "page-updates",
@@ -135,7 +134,7 @@ impl Page {
 			Self::Notifications => "description-notifications",
 			Self::Activity => "description-registered-games",
 			Self::Voice => "description-voice",
-			Self::VoiceOverlay => "description-voice-overlay",
+			Self::Overlay => "description-overlay",
 			Self::Keybinds => "description-keybinds",
 			Self::Storage => "description-storage",
 			Self::Updates => "description-updates",
@@ -171,8 +170,8 @@ impl Page {
 			Self::Voice => {
 				"voice video camera preview audio microphone speakers devices volume gain noise suppression push to talk"
 			}
-			Self::VoiceOverlay => {
-				"voice overlay monitor display speaker position placement identify drag kde wayland"
+			Self::Overlay => {
+				"voice overlay roster monitor display speaker position placement identify drag kde wayland toast notifications screen sharing message alerts"
 			}
 			Self::LanguageTime => {
 				"language time clock 12 hour 24 hour am pm format locale translation"
@@ -329,8 +328,28 @@ impl MessagingUi {
 		self.settings.open && self.settings.page == Page::Voice
 	}
 
-	pub fn voice_overlay_page_open(&self) -> bool {
-		self.settings.open && self.settings.page == Page::VoiceOverlay
+	pub fn overlay_page_open(&self) -> bool {
+		self.settings.open && self.settings.page == Page::Overlay
+	}
+
+	fn overlay_settings(&mut self, ui: &mut egui::Ui) {
+		#[cfg(target_os = "linux")]
+		let notifications = &self.overlay_notifications.saved;
+		#[cfg(not(target_os = "linux"))]
+		let notifications = &model::voice_overlay::NotificationSettings::default();
+		ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+		design::group(ui, "overlay-display-and-layout", |ui| {
+			self.voice_overlay
+				.show_layout(ui, self.language, notifications);
+		});
+		design::group(ui, "overlay-voice-roster", |ui| {
+			self.voice_overlay.show_roster(ui, self.language);
+		});
+		#[cfg(target_os = "linux")]
+		design::group(ui, "page-notifications", |ui| {
+			self.overlay_notifications
+				.show(ui, self.language, &self.voice_overlay);
+		});
 	}
 
 	pub(super) fn open_voice_settings(&mut self) {
@@ -549,9 +568,7 @@ impl MessagingUi {
 											false,
 										);
 									}
-									Page::VoiceOverlay => {
-										self.voice_overlay.show(ui, self.language)
-									}
+									Page::Overlay => self.overlay_settings(ui),
 									Page::Storage => self.storage_page(ui, state),
 									Page::Updates => self.update_settings(ui, state.demo),
 									Page::Keybinds => crate::keybinds::show(

@@ -1,20 +1,109 @@
 //! Applies notification device choices to filtered messages and explicit call ringing state.
-use client_core::{State, auth::AuthState};
+use client_core::{
+	State,
+	auth::AuthState,
+	notifications::{Notification, NotificationCandidate},
+};
 use model::{
 	Id, PresenceStatus,
 	notification_preferences::{Device, Sound},
 };
 use std::time::{Duration, Instant};
 
-pub enum Alert {
-	Message {
-		channel: Id,
-		title: String,
-		body: String,
-		avatar_key: String,
-		image_path: Option<String>,
-	},
+pub fn window_focused(ctx: &eframe::egui::Context) -> bool {
+	ctx.input(|i| {
+		i.focused && i.viewport().visible() != Some(false) && i.viewport().minimized != Some(true)
+	})
 }
+
+/// A positive, time-bounded compositor observation, independent of Serein's own window focus.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GameGate(Option<GameLease>);
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(crate) struct GameLease {
+	pub(crate) generation: u64,
+	pub(crate) until: Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl GameGate {
+	pub(crate) fn recognized(generation: u64, until: Instant) -> Self {
+		Self(Some(GameLease { generation, until }))
+	}
+
+	pub(crate) fn active(self, now: Instant) -> Option<GameLease> {
+		self.0.filter(|lease| now < lease.until)
+	}
+}
+
+/// The normal system notification payload. Native admission keeps at most one pending copy.
+pub(crate) struct DesktopAlert {
+	channel: Id,
+	sender: String,
+	preview: String,
+	avatar_key: String,
+}
+
+impl From<Notification> for DesktopAlert {
+	fn from(value: Notification) -> Self {
+		Self {
+			channel: value.channel,
+			sender: value.sender,
+			preview: value.preview,
+			avatar_key: value.avatar_key,
+		}
+	}
+}
+
+impl DesktopAlert {
+	#[cfg(target_os = "linux")]
+	pub(crate) fn pending(value: &Notification) -> Self {
+		Self {
+			channel: value.channel,
+			sender: value.sender.clone(),
+			preview: value.preview.clone(),
+			avatar_key: value.avatar_key.clone(),
+		}
+	}
+
+	pub(crate) fn show(
+		self,
+		state: &State,
+		sink: &platform::notifications::Notifications,
+		avatars: Option<&crate::avatars::AvatarWorker>,
+	) {
+		let image = state
+			.user
+			.as_ref()
+			.and_then(|user| crate::avatars::notification_image_path(user.id, &self.avatar_key));
+		if sink.notify_channel(self.channel, self.sender, self.preview, image)
+			&& let Some(avatars) = avatars
+		{
+			avatars.request(self.avatar_key);
+		}
+	}
+}
+
+/// Pick a single visual route. Only demonstrably unshown geometry failures may fall back later.
+pub fn route_visual<T>(
+	candidate: T,
+	os_enabled: bool,
+	overlay: impl FnOnce(&T) -> bool,
+	os: impl FnOnce(T),
+) -> bool {
+	if overlay(&candidate) {
+		return true;
+	}
+	if os_enabled {
+		os(candidate);
+	}
+	// The system notification preference retains its existing one-ping accounting on handoff.
+	os_enabled
+}
+
 #[derive(Default)]
 pub struct Runtime {
 	sounds: crate::notification_sounds::Sounds,
@@ -132,7 +221,7 @@ impl Runtime {
 		// Another account may sign in next; its conversations start without alert history.
 		self.pinged_directs.clear();
 	}
-	/// Returns a coalesced desktop alert request. Sound is independent of desktop alerts.
+	/// Hands off at most one coalesced visual candidate. Message sound is independent.
 	pub fn poll(
 		&mut self,
 		state: &mut State,
@@ -140,7 +229,8 @@ impl Runtime {
 		window: &winit::window::Window,
 		ctx: &eframe::egui::Context,
 		fixture: bool,
-	) -> Option<Alert> {
+		visual: impl FnOnce(&State, &ui::MessagingUi, NotificationCandidate, Instant) -> bool,
+	) {
 		let live = !fixture && !state.demo && state.auth == AuthState::Authenticated;
 		let audible = live && ui.own_presence.status != PresenceStatus::DoNotDisturb;
 		let options = ui.notification_options;
@@ -151,11 +241,7 @@ impl Runtime {
 			self.options = options;
 		}
 		self.was_audible = audible;
-		let focused = ctx.input(|i| {
-			i.focused
-				&& i.viewport().visible() != Some(false)
-				&& i.viewport().minimized != Some(true)
-		});
+		let focused = window_focused(ctx);
 		let incoming = state.voice.incoming.filter(|id| {
 			audible && state.notification_allowed(*id) && options.allows(Sound::IncomingRing)
 		});
@@ -166,7 +252,14 @@ impl Runtime {
 		let ringing = incoming
 			.map(|id| (id, Sound::IncomingRing))
 			.or_else(|| outgoing.map(|id| (id, Sound::OutgoingRing)));
-		let (alert, sound) = self.deliver(state, ui, audible, focused, ringing, Instant::now());
+		let sound = self.deliver(
+			state,
+			ui,
+			(audible, focused),
+			ringing,
+			Instant::now(),
+			visual,
+		);
 		if self.ring.is_some() {
 			ctx.request_repaint_after(Duration::from_millis(250));
 		}
@@ -209,7 +302,6 @@ impl Runtime {
 		} else {
 			sound_status
 		};
-		alert
 	}
 	/// Turns queued message notifications, the call ringtone and a settings preview into
 	/// at most one desktop alert and one sound, and records which direct conversations used
@@ -218,13 +310,16 @@ impl Runtime {
 		&mut self,
 		state: &mut State,
 		ui: &mut ui::MessagingUi,
-		audible: bool,
-		focused: bool,
+		(audible, focused): (bool, bool),
 		ringing: Option<(Id, Sound)>,
 		now: Instant,
-	) -> (Option<Alert>, Option<Sound>) {
+		visual: impl FnOnce(&State, &ui::MessagingUi, NotificationCandidate, Instant) -> bool,
+	) -> Option<Sound> {
 		let options = ui.notification_options;
 		let mut alert = None;
+		let visual_enabled = ui.notifications_enabled;
+		#[cfg(target_os = "linux")]
+		let visual_enabled = visual_enabled || ui.overlay_notifications.saved.enabled;
 		let mut sound = None;
 		let one_ping = ui.interface_tweak_on(extensions::InterfaceTweak::OnePingPerDirectMessage);
 		if !one_ping {
@@ -232,15 +327,16 @@ impl Runtime {
 		}
 		// Alerts and sounds in one poll coalesce to the last eligible one of each; only the
 		// conversations behind those use up their one ping.
-		let (mut alerted, mut sounded) = (None, None);
-		while let Some(notification) = state.take_notification() {
+		let mut sounded = None;
+		while let Some(candidate) = state.take_notification_candidate() {
+			let notification = &candidate.notification;
 			let current = focused && ui.viewing_latest(notification.channel);
 			let cue = if current {
 				Sound::CurrentChannel
 			} else {
 				Sound::Message
 			};
-			let desktop = audible && ui.notifications_enabled && !current;
+			let desktop = audible && visual_enabled && !current;
 			let audio = audible && options.allows(cue);
 			let key = (
 				notification.is_direct(),
@@ -255,17 +351,7 @@ impl Runtime {
 				continue;
 			}
 			if desktop {
-				let image_path = state.user.as_ref().and_then(|user| {
-					crate::avatars::notification_image_path(user.id, &notification.avatar_key)
-				});
-				alert = Some(Alert::Message {
-					channel: notification.channel,
-					title: notification.sender,
-					body: notification.preview,
-					avatar_key: notification.avatar_key,
-					image_path,
-				});
-				alerted = Some(key);
+				alert = Some((key, candidate));
 			}
 			if audio {
 				sound = Some(cue);
@@ -284,12 +370,14 @@ impl Runtime {
 		}
 		// Only the alert shown and a message sound that actually plays use up a
 		// conversation's one ping.
+		let alerted = alert
+			.and_then(|(key, notification)| visual(state, ui, notification, now).then_some(key));
 		if one_ping {
 			for key in alerted.into_iter().chain(sounded.map(|(key, _)| key)) {
 				record_ping(&mut self.pinged_directs, key);
 			}
 		}
-		(alert, sound)
+		sound
 	}
 }
 
@@ -452,8 +540,13 @@ mod tests {
 		let mut runtime = Runtime::default();
 		let deliver =
 			|runtime: &mut Runtime, state: &mut State, ui: &mut ui::MessagingUi, audible: bool| {
-				let (alert, sound) = runtime.deliver(state, ui, audible, false, None, now);
-				(alert.is_some(), sound)
+				let mut delivered = false;
+				let sound =
+					runtime.deliver(state, ui, (audible, false), None, now, |_, _, _, _| {
+						delivered = true;
+						true
+					});
+				(delivered, sound)
 			};
 		let first = send(&mut state, dm.id);
 		assert_eq!(
@@ -526,6 +619,67 @@ mod tests {
 			(false, None),
 			"the DM's own sound used up its ping"
 		);
+
+		#[cfg(target_os = "linux")]
+		{
+			let mut runtime = Runtime::default();
+			ui.overlay_notifications.saved.enabled = true;
+			ui.notification_options.new_message = false;
+			send(&mut state, dm.id);
+			let newest = send(&mut state, dm.id);
+			let attempt = |runtime: &mut Runtime,
+			               state: &mut State,
+			               ui: &mut ui::MessagingUi,
+			               expected,
+			               admit,
+			               os| {
+				let mut calls = 0;
+				let mut os_calls = 0;
+				let sound =
+					runtime.deliver(state, ui, (true, false), None, now, |_, ui, alert, _| {
+						calls += 1;
+						assert_eq!(alert.notification.message, expected);
+						route_visual(
+							alert,
+							ui.notifications_enabled,
+							|_| admit,
+							|_| os_calls += 1,
+						)
+					});
+				assert_eq!(sound, None);
+				assert_eq!(os_calls, usize::from(os));
+				calls
+			};
+			assert_eq!(
+				attempt(&mut runtime, &mut state, &mut ui, newest, false, false),
+				1
+			);
+			let next = send(&mut state, dm.id);
+			ui.notifications_enabled = true;
+			assert_eq!(
+				attempt(&mut runtime, &mut state, &mut ui, next, true, false),
+				1
+			);
+			let repeated = send(&mut state, dm.id);
+			assert_eq!(
+				attempt(&mut runtime, &mut state, &mut ui, repeated, false, false),
+				0
+			);
+			state
+				.apply_read_state(read_state::Event::Ack {
+					channel: dm.id,
+					message: Some(next),
+					manual: true,
+					mention_count: Some(0),
+					version: None,
+				})
+				.unwrap();
+			let fallback = send(&mut state, dm.id);
+			assert_eq!(
+				attempt(&mut runtime, &mut state, &mut ui, fallback, false, true),
+				1
+			);
+		}
 	}
 
 	#[test]

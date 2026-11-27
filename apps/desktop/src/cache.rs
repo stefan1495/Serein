@@ -907,6 +907,7 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn voice_overlay_retry_persists_the_latest_applied_preferences_after_a_write_failure() {
+		use crate::app_settings::OverlaySection;
 		use ui::voice_overlay::Persistence;
 
 		let (send, commands) = mpsc::sync_channel(1);
@@ -924,7 +925,7 @@ mod tests {
 		let mut view = ui::MessagingUi::default();
 		settings.apply(&mut view);
 		let persistence = |settings: &crate::app_settings::Settings, view: &ui::MessagingUi| {
-			settings.overlay_persistence(&view.voice_overlay, true)
+			settings.overlay_persistence(view, OverlaySection::Layout, true)
 		};
 		let finish = |settings: &mut crate::app_settings::Settings, store: &mut _| {
 			let (_, account, epoch, operation, _reservation) = commands.try_recv().unwrap();
@@ -944,6 +945,9 @@ mod tests {
 		settings.observe(&view);
 		assert_eq!(persistence(&settings, &view), Persistence::Saving);
 		view.voice_overlay.saved.monitor = Some("DP-2".into());
+		view.voice_overlay.saved.roster = model::voice_overlay::RosterMode::Everyone;
+		view.overlay_notifications.saved.enabled = true;
+		view.overlay_notifications.saved.corner = model::voice_overlay::ToastCorner::BottomLeft;
 		view.notifications_enabled = !view.notifications_enabled;
 		settings.observe(&view);
 		assert!(!settings.save(Some(&cache), 1));
@@ -958,7 +962,11 @@ mod tests {
 		);
 		assert!(!settings.save(Some(&cache), 1));
 
-		settings.retry_overlay_save(&view.voice_overlay, true);
+		assert_eq!(
+			settings.overlay_persistence(&view, OverlaySection::Notifications, true),
+			Persistence::Failed { retry: true }
+		);
+		settings.retry_overlay_save(&view, OverlaySection::Notifications, true);
 		assert!(settings.save(Some(&cache), 1));
 		assert_eq!(persistence(&settings, &view), Persistence::Saving);
 		finish(&mut settings, &mut store);
@@ -967,6 +975,11 @@ mod tests {
 		let stored = store.unwrap().app_preferences().unwrap();
 		assert_eq!(stored.voice_overlay_monitor.as_deref(), Some("DP-2"));
 		assert_eq!(stored.notifications_enabled, view.notifications_enabled);
+		assert_eq!(stored.voice_overlay_roster, view.voice_overlay.saved.roster);
+		assert_eq!(
+			stored.overlay_notifications,
+			view.overlay_notifications.saved
+		);
 
 		view.notifications_enabled = !view.notifications_enabled;
 		settings.observe(&view);

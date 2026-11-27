@@ -11,10 +11,12 @@ struct Speaker {
 	offset: usize,
 	length: usize,
 	activity: u8,
+	pcm_revision: Option<u64>,
 }
 #[derive(Default)]
 pub(crate) struct Mixer {
 	speakers: Vec<Speaker>,
+	deafen_revision: u64,
 }
 impl Mixer {
 	pub fn announce(&mut self, user: u64, ssrc: u32) -> Result<(), &'static str> {
@@ -46,6 +48,7 @@ impl Mixer {
 			offset: 0,
 			length: 0,
 			activity: 0,
+			pcm_revision: None,
 		});
 		Ok(())
 	}
@@ -58,9 +61,9 @@ impl Mixer {
 			.find(|s| s.ssrc == ssrc)
 			.map(|s| s.user)
 	}
-	pub fn push(&mut self, ssrc: u32, sequence: u16, opus: Vec<u8>) {
+	pub fn push(&mut self, ssrc: u32, sequence: u16, opus: Vec<u8>, revision: u64) {
 		if let Some(speaker) = self.speakers.iter_mut().find(|s| s.ssrc == ssrc) {
-			speaker.jitter.push(sequence, opus);
+			speaker.jitter.push(sequence, opus, revision);
 		}
 	}
 	pub fn clear(&mut self) {
@@ -70,6 +73,7 @@ impl Mixer {
 			speaker.offset = 0;
 			speaker.length = 0;
 			speaker.activity = 0;
+			speaker.pcm_revision = None;
 		}
 	}
 	pub fn speaking(&self) -> impl Iterator<Item = u64> + '_ {
@@ -81,9 +85,21 @@ impl Mixer {
 	/// Mix one 20ms frame, preserving up to 120ms packets without bursting playback queues.
 	#[cfg(test)]
 	pub fn pop(&mut self) -> (Option<Frame>, bool) {
-		self.pop_with_volumes(&[])
+		self.pop_with_volumes(&[], 0)
 	}
-	pub fn pop_with_volumes(&mut self, volumes: &[(u64, u16)]) -> (Option<Frame>, bool) {
+	pub fn pop_with_volumes(
+		&mut self,
+		volumes: &[(u64, u16)],
+		revision: u64,
+	) -> (Option<Frame>, bool) {
+		// A coalesced deafen/undeafen can leave packet audio buffered. Keep playback
+		// unchanged, but don't measure that audio as activity in the new revision.
+		if self.deafen_revision != revision {
+			self.deafen_revision = revision;
+			for speaker in &mut self.speakers {
+				speaker.activity = 0;
+			}
+		}
 		let mut output = [0.0; 960];
 		let mut active = false;
 		let mut heard = false;
@@ -104,7 +120,7 @@ impl Mixer {
 					if decoded == 8 {
 						break;
 					}
-					let Some(opus) = speaker.jitter.pop() else {
+					let Some((opus, packet_revision)) = speaker.jitter.pop() else {
 						break;
 					};
 					decoded += 1;
@@ -125,6 +141,9 @@ impl Mixer {
 					else {
 						continue;
 					};
+					if packet_revision.is_some() {
+						speaker.pcm_revision = packet_revision;
+					}
 					speaker.offset = 0;
 					speaker.length = length;
 					heard |= !opus.is_empty() && opus != davey::OPUS_SILENCE_PACKET;
@@ -136,7 +155,9 @@ impl Mixer {
 				{
 					if sample.is_finite() {
 						*mixed += sample * gain;
-						energy += sample * sample;
+						if speaker.pcm_revision == Some(revision) {
+							energy += sample * sample;
+						}
 					}
 				}
 				speaker.offset += count;
@@ -165,6 +186,21 @@ mod tests {
 		encoded[..length].to_vec()
 	}
 	#[test]
+	fn deafen_revision_drops_buffered_activity_without_changing_playback() {
+		let mut mixer = Mixer::default();
+		mixer.announce(1, 11).unwrap();
+		let packet = opus(0.1);
+		mixer.push(11, 1, packet.clone(), 0);
+		mixer.push(11, 2, packet, 2); // Two transitions coalesced between mixer ticks.
+		mixer.pop_with_volumes(&[], 2);
+		mixer.pop_with_volumes(&[], 2);
+		assert!(mixer.pop_with_volumes(&[], 2).0.is_some());
+		assert_eq!(mixer.speaking().next(), None);
+		mixer.pop_with_volumes(&[(1, 0)], 2);
+		assert_eq!(mixer.speaking().next(), Some(1));
+	}
+
+	#[test]
 	fn independent_streams_mix_on_one_clock_and_release_on_leave() {
 		let mut together = Mixer::default();
 		let mut alice = Mixer::default();
@@ -175,8 +211,8 @@ mod tests {
 			single.announce(user, ssrc).unwrap();
 			// Same sequence from separate SSRCs must never collide or share decoder state.
 			let packet = opus(frequency);
-			together.push(ssrc, 7, packet.clone());
-			single.push(ssrc, 7, packet);
+			together.push(ssrc, 7, packet.clone(), 0);
+			single.push(ssrc, 7, packet, 0);
 		}
 		assert!(together.announce(3, 11).is_err());
 		for _ in 0..2 {
@@ -217,10 +253,11 @@ mod tests {
 			] {
 				for speaker in &mut mixer.speakers {
 					speaker.pcm.fill(speaker.user as f32 * 0.1);
+					speaker.pcm_revision = Some(0);
 					speaker.offset = 0;
 					speaker.length = 960;
 				}
-				let frame = mixer.pop_with_volumes(&volumes).0.unwrap();
+				let frame = mixer.pop_with_volumes(&volumes, 0).0.unwrap();
 				assert!(
 					frame
 						.iter()
@@ -234,7 +271,7 @@ mod tests {
 			}
 			assert!(
 				mixer
-					.pop_with_volumes(&[(1, 200)])
+					.pop_with_volumes(&[(1, 200)], 0)
 					.0
 					.unwrap()
 					.iter()
@@ -272,7 +309,7 @@ mod tests {
 					let length = reference.decode_float(packet, &mut decoded, false).unwrap();
 					assert_eq!(length, samples);
 					expected.extend(decoded[..length].iter().copied());
-					mixer.push(11, sequence, packet.to_vec());
+					mixer.push(11, sequence, packet.to_vec(), 0);
 					sequence = sequence.wrapping_add(1);
 				}
 				if let Some(frame) = mixer.pop().0 {
@@ -330,7 +367,7 @@ mod tests {
 				);
 				expected.extend(decoded);
 				if sequence != 1 {
-					mixer.push(11, sequence, packet.to_vec());
+					mixer.push(11, sequence, packet.to_vec(), 0);
 				}
 			}
 			assert!(mixer.pop().0.is_none());

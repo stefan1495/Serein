@@ -29,9 +29,12 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 symphonia = { version = "=0.6.1", default-features = false, features = ["aac"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.189"
 wayland-backend = { version = "=0.3.17", features = ["client_system", "dlopen"] }
 wayland-client = "=0.31.15"
 wayland-protocols = { version = "=0.32.13", features = ["client", "staging"] }
+wayland-protocols-plasma = { version = "=0.3.12", features = ["client"] }
+rustix = { version = "=1.1.6", features = ["event", "net"] }
 smithay-client-toolkit = { version = "=0.20.0", default-features = false, features = ["calloop"] }
 pangocairo = "=0.22.0"
 x11-dl = "=2.21.0"

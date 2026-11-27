@@ -138,13 +138,15 @@ Windows/Linux local staging artifacts remain unsigned. These are not certified i
 
 The webview lives only during login: WKWebView on macOS, WebView2 on Windows, GTK/WebKitGTK on Linux. Linux uses a separate GTK authentication window and pumps it only while login is active. Voice is built in. Audio devices open only for explicit playback, device testing, or a call reaching required encrypted readiness. Popup-dependent authentication and third-party embedded challenges may not work; do not claim all Discord login methods without live tests.
 
-## Built-in voice overlay
+## Built-in overlay
 
-The [voice overlay](voice-overlay.md) uses layer-shell on native KDE Plasma Wayland. Live rows
-on the configured display never take focus or receive clicks. The placement editor also needs
-subsurfaces, viewporter and logical output dimensions. Its temporary surface only accepts input
-on the preview's drag handle; Identify is fully click-through. There is no focusable-window
-fallback, local voice socket or external overlay tool. Other compositors, X11, Windows and macOS
+The [overlay](voice-overlay.md) uses layer-shell on native KDE Plasma Wayland. Live voice rows and
+notification toasts never take focus or receive clicks. The paired editor also needs subsurfaces,
+viewporter and sufficient logical output dimensions. Its temporary surface accepts input only
+on the two drag handles; Identify is fully click-through. The optional live toasts additionally
+require a fresh active-window report from KDE's Plasma window-management protocol and a locally
+recognized executable. Unknown focus uses the normal desktop fallback when enabled. There is no
+focusable-window fallback or external overlay tool. Other compositors, X11, Windows and macOS
 are outside this implementation.
 
 ## Linux system appearance

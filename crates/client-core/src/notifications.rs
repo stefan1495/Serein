@@ -7,6 +7,7 @@ const MAX_OBSERVED: usize = 4096;
 const MAX_OBSERVED_BYTES: usize = 128 * 1024;
 const MAX_NOTIFICATIONS: usize = 32;
 const MAX_NOTIFICATION_BYTES: usize = 16 * 1024;
+const MAX_QUEUED_OVERLAY_EXCERPT_BYTES: usize = 4 * 1024;
 const MAX_SETTINGS_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct Notification {
@@ -22,10 +23,29 @@ pub struct Notification {
 	everyone: bool,
 	roles: Vec<Id>,
 }
+/// The channel/mention policy at alert handoff, without sender or message text.
+#[derive(Clone, Copy)]
+pub struct ChannelAdmission {
+	channel: Id,
+	mention: bool,
+}
+
+impl ChannelAdmission {
+	pub fn allows(self, state: &State) -> bool {
+		state.notification_allowed_for(self.channel, self.mention)
+	}
+}
+
 impl Notification {
 	/// Whether the message came from a direct or group conversation.
 	pub fn is_direct(&self) -> bool {
 		self.conversation
+	}
+	pub fn channel_admission(&self, state: &State) -> ChannelAdmission {
+		ChannelAdmission {
+			channel: self.channel,
+			mention: state.mention_matches(self.channel, self.direct, self.everyone, &self.roles),
+		}
 	}
 	fn bytes(&self) -> usize {
 		size_of::<Self>()
@@ -33,6 +53,29 @@ impl Notification {
 			+ self.sender.capacity()
 			+ self.preview.capacity()
 			+ self.avatar_key.capacity()
+	}
+}
+
+/// One eligible alert; the overlay fields follow the original notification's lifetime but do not
+/// count against its desktop/sound budget. Their inline storage is bounded by MAX_NOTIFICATIONS.
+pub struct NotificationCandidate {
+	pub notification: Notification,
+	unknown_sender: bool,
+	overlay_excerpt: Option<Box<str>>,
+}
+
+impl NotificationCandidate {
+	pub fn overlay_sender(&self) -> &str {
+		if self.unknown_sender {
+			""
+		} else {
+			&self.notification.sender
+		}
+	}
+
+	/// Proven plain source text, never the existing OS preview.
+	pub fn overlay_excerpt(&self) -> Option<&str> {
+		self.overlay_excerpt.as_deref()
 	}
 }
 
@@ -51,6 +94,27 @@ fn alert_text(text: &str, chars: usize, bytes: usize) -> String {
 	}
 	output.trim().to_owned()
 }
+/// Deliberately accept only proven plain user text. Inspect the entire bounded source before
+/// truncating; markup or unknown formats (including any spoiler delimiter) fail closed.
+fn overlay_excerpt(message: &Message) -> Option<String> {
+	if !matches!(message.kind, 0 | 19)
+		|| message.forwarded
+		|| message.ephemeral
+		|| message.unsupported
+		|| message.content.len() > 8192
+		|| !message.attachments.is_empty()
+		|| !message.embeds.is_empty()
+		|| !message
+			.content
+			.chars()
+			.all(|ch| ch.is_alphanumeric() || matches!(ch, ' ' | ',' | '.' | '!' | '?' | '\''))
+	{
+		return None;
+	}
+	let excerpt = model::voice_overlay::label(&message.content, 240, 512);
+	(!excerpt.is_empty()).then_some(excerpt)
+}
+
 #[derive(Default)]
 pub(crate) struct Activity {
 	counts: BTreeMap<Id, u32>,
@@ -58,7 +122,7 @@ pub(crate) struct Activity {
 	observed_counts: BTreeMap<Id, (u32, u32)>,
 	/// Channel, message, local mention, service coverage, and proven service contribution at creation.
 	observed: VecDeque<(Id, Id, bool, bool, bool)>,
-	notifications: VecDeque<Notification>,
+	notifications: VecDeque<NotificationCandidate>,
 }
 impl Activity {
 	pub(crate) fn clear_notifications(&mut self) {
@@ -72,13 +136,14 @@ impl Activity {
 		self.counts.remove(&channel);
 		self.observed_counts.remove(&channel);
 		self.observed.retain(|(c, ..)| *c != channel);
-		self.notifications.retain(|n| n.channel != channel);
+		self.notifications
+			.retain(|n| n.notification.channel != channel);
 	}
 	pub(crate) fn delete(&mut self, channel: Id, message: Id) {
 		self.observed
 			.retain(|(c, id, ..)| (*c, *id) != (channel, message));
 		self.notifications
-			.retain(|n| (n.channel, n.message) != (channel, message));
+			.retain(|n| (n.notification.channel, n.notification.message) != (channel, message));
 		if self.observed_counts.contains_key(&channel) {
 			self.recount(channel);
 		}
@@ -101,8 +166,10 @@ impl Activity {
 				}
 				keep
 			});
-		self.notifications
-			.retain(|n| n.channel != channel || message.is_none_or(|read| n.message > read));
+		self.notifications.retain(|n| {
+			n.notification.channel != channel
+				|| message.is_none_or(|read| n.notification.message > read)
+		});
 		acknowledged
 	}
 
@@ -736,7 +803,7 @@ impl State {
 				activity
 					.notifications
 					.iter()
-					.map(|notification| notification.channel),
+					.map(|candidate| candidate.notification.channel),
 			)
 			.filter(|channel| !self.can_view(*channel))
 			.collect();
@@ -744,16 +811,25 @@ impl State {
 			self.read_state.activity.revoke(channel);
 		}
 	}
+	/// Apply the local opt-in to future alerts; disabling also clears queued excerpts.
+	pub fn set_notification_excerpts(&mut self, enabled: bool) {
+		if self.read_state.notification_excerpts && !enabled {
+			for candidate in &mut self.read_state.activity.notifications {
+				candidate.overlay_excerpt = None;
+			}
+		}
+		self.read_state.notification_excerpts = enabled;
+	}
+
 	pub fn take_notification(&mut self) -> Option<Notification> {
-		while let Some(notification) = self.read_state.activity.notifications.pop_front() {
-			let mention = self.mention_matches(
-				notification.channel,
-				notification.direct,
-				notification.everyone,
-				&notification.roles,
-			);
-			if self.notification_allowed_for(notification.channel, mention) {
-				return Some(notification);
+		self.take_notification_candidate()
+			.map(|candidate| candidate.notification)
+	}
+
+	pub fn take_notification_candidate(&mut self) -> Option<NotificationCandidate> {
+		while let Some(candidate) = self.read_state.activity.notifications.pop_front() {
+			if candidate.notification.channel_admission(self).allows(self) {
+				return Some(candidate);
 			}
 		}
 		None
@@ -1151,7 +1227,8 @@ impl State {
 			return;
 		}
 		let sender = alert_text(self.message_author_name(message), 80, 256);
-		let sender = if sender.is_empty() {
+		let unknown_sender = sender.is_empty();
+		let sender = if unknown_sender {
 			"Unknown sender".to_owned()
 		} else {
 			sender
@@ -1191,16 +1268,44 @@ impl State {
 			|| activity
                 .notifications
                 .iter()
-                .map(Notification::bytes)
+                .map(|candidate| candidate.notification.bytes())
                 .sum::<usize>()
                 + notification.bytes()
-                // Include unused deque slots; capacity never exceeds the 32-item ceiling.
+                // Charge all legacy base slots, including unused ones, without the overlay fields.
                 + (MAX_NOTIFICATIONS - activity.notifications.len() - 1) * size_of::<Notification>()
 				> MAX_NOTIFICATION_BYTES
 		{
 			activity.notifications.pop_front();
 		}
-		activity.notifications.push_back(notification);
+		let excerpt = if self.read_state.notification_excerpts {
+			overlay_excerpt(message).map(String::into_boxed_str)
+		} else {
+			None
+		};
+		if let Some(excerpt) = &excerpt {
+			let mut bytes = excerpt.len()
+				+ activity
+					.notifications
+					.iter()
+					.filter_map(NotificationCandidate::overlay_excerpt)
+					.map(str::len)
+					.sum::<usize>();
+			// Prefer the newest excerpts, dropping only optional text under overlay pressure.
+			for candidate in &mut activity.notifications {
+				if bytes <= MAX_QUEUED_OVERLAY_EXCERPT_BYTES {
+					break;
+				}
+				bytes -= candidate
+					.overlay_excerpt
+					.take()
+					.map_or(0, |text| text.len());
+			}
+		}
+		activity.notifications.push_back(NotificationCandidate {
+			notification,
+			unknown_sender,
+			overlay_excerpt: excerpt,
+		});
 	}
 }
 
@@ -1407,6 +1512,113 @@ mod tests {
 			assert!(alert.bytes() <= MAX_NOTIFICATION_BYTES);
 		}
 	}
+	#[test]
+	fn overlay_excerpt_only_admits_bounded_plain_source_without_modifying_os_preview() {
+		let mut state = notification_state();
+		let mut incoming = message(100, 20);
+		let plain = "𐐷".repeat(180);
+		incoming.content = plain.clone();
+		state.observe_notification(&incoming);
+		state.set_notification_excerpts(true);
+		assert!(
+			state
+				.take_notification_candidate()
+				.unwrap()
+				.overlay_excerpt()
+				.is_none()
+		);
+
+		incoming.id = Id(101);
+		incoming.content = format!("{plain}\u{7c}\u{7c}protected");
+		state.observe_notification(&incoming);
+		let candidate = state.take_notification_candidate().unwrap();
+		assert!(candidate.notification.preview.starts_with('𐐷'));
+		assert_eq!(
+			candidate.overlay_excerpt(),
+			None,
+			"inspect beyond the display limit"
+		);
+
+		incoming.id = Id(102);
+		incoming.content = plain;
+		state.observe_notification(&incoming);
+		let candidate = state.take_notification_candidate().unwrap();
+		assert_eq!(candidate.overlay_excerpt().unwrap(), "𐐷".repeat(128));
+
+		incoming.id = Id(103);
+		state.observe_notification(&incoming);
+		state.set_notification_excerpts(false);
+		state.set_notification_excerpts(true);
+		assert!(
+			state
+				.take_notification_candidate()
+				.unwrap()
+				.overlay_excerpt()
+				.is_none()
+		);
+
+		incoming.id = Id(104);
+		incoming.content.clear();
+		state.observe_notification(&incoming);
+		let candidate = state.take_notification_candidate().unwrap();
+		assert_eq!(candidate.notification.preview, "Sent a message");
+		assert!(candidate.overlay_excerpt().is_none());
+		incoming.content = "Forwarded text".into();
+		incoming.forwarded = true;
+		assert!(overlay_excerpt(&incoming).is_none());
+	}
+
+	#[test]
+	fn capped_overlay_excerpts_do_not_change_notification_queue_eviction_or_order() {
+		let mut disabled = notification_state();
+		let mut enabled = notification_state();
+		enabled.set_notification_excerpts(true);
+		let mut incoming = message(100, 20);
+		incoming.content = "𐐷".repeat(180);
+		incoming.mention_roles = (10..50).map(Id).collect();
+		let end = 200;
+		for id in 100..end {
+			incoming.id = Id(id);
+			disabled.observe_notification(&incoming);
+			enabled.observe_notification(&incoming);
+		}
+		let mut legacy = Vec::new();
+		while let Some(candidate) = disabled.take_notification_candidate() {
+			assert!(candidate.overlay_excerpt().is_none());
+			legacy.push(candidate.notification.message);
+		}
+		assert!(
+			(1..MAX_NOTIFICATIONS).contains(&legacy.len()),
+			"legacy byte pressure must retain a nonempty suffix below the item ceiling"
+		);
+		assert_eq!(
+			legacy,
+			(end - legacy.len() as u64..end).map(Id).collect::<Vec<_>>()
+		);
+		let mut overlay = Vec::new();
+		let mut excerpt_bytes = 0;
+		while let Some(candidate) = enabled.take_notification_candidate() {
+			let id = candidate.notification.message;
+			let excerpt = candidate.overlay_excerpt();
+			if id == legacy[0] {
+				assert!(
+					excerpt.is_none(),
+					"keep the legacy candidate as metadata only"
+				);
+			}
+			if id == Id(end - 1) {
+				assert!(
+					excerpt.is_some(),
+					"retain optional text for the newest candidate"
+				);
+			}
+			excerpt_bytes += excerpt.map_or(0, str::len);
+			overlay.push(id);
+		}
+		assert_eq!(overlay, legacy);
+		assert!(excerpt_bytes <= MAX_QUEUED_OVERLAY_EXCERPT_BYTES);
+	}
+
 	#[test]
 	fn guild_defaults_controls_timers_and_unknown_preferences() {
 		let mut state = notification_state();
@@ -1834,8 +2046,10 @@ mod tests {
 				"Payload budget evicts before item ceiling"
 			);
 			assert!(
-				queue.iter().map(Notification::bytes).sum::<usize>()
-					+ (queue.capacity() - queue.len()) * size_of::<Notification>()
+				queue
+					.iter()
+					.map(|candidate| candidate.notification.bytes())
+					.sum::<usize>() + (queue.capacity() - queue.len()) * size_of::<Notification>()
 					<= MAX_NOTIFICATION_BYTES
 			);
 			state

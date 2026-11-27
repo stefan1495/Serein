@@ -401,6 +401,7 @@ enum SpeakerEpoch {
 struct SpeakerPublisher {
 	next: Instant,
 	last: [u64; 64],
+	revision: crate::ActivityRevision,
 	epoch: SpeakerEpoch,
 }
 
@@ -409,6 +410,7 @@ impl SpeakerPublisher {
 		Self {
 			next: now,
 			last: [0; 64],
+			revision: crate::ActivityRevision::default(),
 			epoch: SpeakerEpoch::Current,
 		}
 	}
@@ -436,6 +438,7 @@ impl SpeakerPublisher {
 		&mut self,
 		now: Instant,
 		local: u64,
+		revision: crate::ActivityRevision,
 		remote: impl Iterator<Item = u64>,
 		emit: &impl Fn(Status) -> Result<(), ()>,
 	) -> Result<(), &'static str> {
@@ -449,9 +452,11 @@ impl SpeakerPublisher {
 			*slot = user;
 		}
 		let fresh_epoch = matches!(self.epoch, SpeakerEpoch::NeedsSample);
-		if fresh_epoch || users != self.last {
-			emit(Status::Speaking(Box::new(users))).map_err(|_| "Call interface closed")?;
+		if fresh_epoch || users != self.last || self.revision != revision {
+			emit(Status::Speaking(Box::new(users), revision))
+				.map_err(|_| "Call interface closed")?;
 			self.last = users;
+			self.revision = revision;
 			if fresh_epoch {
 				self.epoch = SpeakerEpoch::Current;
 			}
@@ -601,6 +606,7 @@ async fn run_inner(
 	let mut capture_enabled = false;
 	let mut capture_reset = true;
 	let mut local_activity = 0;
+	let mut local_revision = crate::ActivityRevision::default();
 	let mut speakers = SpeakerPublisher::new(Instant::now());
 	loop {
 		if let Some(reason) = reconnect.take() {
@@ -777,6 +783,10 @@ async fn run_inner(
 					   } else {
 						   capture_pacer.next(&capture,enabled && !control.muted && !control.deafened,stalled)
 					   };
+					   if local_revision != control.activity_revision {
+						   local_revision = control.activity_revision;
+						   local_activity = 0;
+					   }
 					   local_activity=if (enabled || waiting) && !control.muted && !control.deafened && !stalled {
 						   crate::activity::hold_at(latest.as_ref().map_or(0.0, |frame| frame.iter().filter(|s| s.is_finite()).map(|s| s*s).sum()),local_activity,control.activity_threshold_db)
 					   } else {0};
@@ -809,7 +819,7 @@ async fn run_inner(
 					   if enabled && !control.deafened {
 						   if stalled {mixer.clear();}
 						   let start = metrics.start();
-						   let (frame,remote_audio)=mixer.pop_with_volumes(&control.user_volumes);
+						   let (frame,remote_audio)=mixer.pop_with_volumes(&control.user_volumes,control.activity_revision.deafen);
 		let extra=stream_audio.as_ref().and_then(|aux|stream_playout.next(aux,control.stream_volume,true,stalled));
 		let frame=crate::PlaybackFrame::mix(frame,extra);
 						   metrics.finish(crate::diagnostics::Stage::Mix, start);
@@ -820,7 +830,7 @@ async fn run_inner(
 					   metrics.stream_audio([0,0,0,0,0,0,0,0,bridge_drops,bridge_underruns]);
 					   metrics.poll(false, drops, stalled, 0);
 					   let local_speaker=if local_activity>0 {credentials.user.0} else {0};
-					   speakers.publish(now,local_speaker,mixer.speaking(),&emit)?;
+					   speakers.publish(now,local_speaker,control.activity_revision,mixer.speaking(),&emit)?;
 				   },
 				   result=async {match &udp {Some(socket)=>socket.recv(&mut packet).await,None=>std::future::pending().await}}=>{
 					   let length=match result {Ok(length)=>length,Err(error) if transient_receive(&error)=>continue,Err(_)=>return Err("Voice UDP receive failed")};
@@ -864,9 +874,10 @@ async fn run_inner(
 					   if rtp.payload_type!=120 {continue;}
 					   let (source,seq,frame)=(rtp.ssrc,rtp.sequence,rtp.payload);
 					   let Some(user)=mixer.user(source) else{continue;};
-					   if !dave.ready || !dave.contains(user) || controls.borrow().deafened {continue;}
+					   let (deafened, revision) = { let control = controls.borrow(); (control.deafened, control.activity_revision.deafen) };
+					   if !dave.ready || !dave.contains(user) || deafened {continue;}
 					   let Ok(opus)=dave.session.decrypt(user,davey::MediaType::AUDIO,&frame) else{continue;};
-					   mixer.push(source,seq,opus);
+					   mixer.push(source,seq,opus,revision);
 					   metrics.finish(crate::diagnostics::Stage::Receive, start);
 				   },
 				   event=ws.next()=>{
@@ -1992,7 +2003,7 @@ mod tests {
 		let mut speakers = SpeakerPublisher::new(start);
 		let samples = std::cell::RefCell::new(Vec::new());
 		let emit = |status| {
-			if let Status::Speaking(users) = status {
+			if let Status::Speaking(users, _) = status {
 				samples.borrow_mut().push(users);
 			}
 			Ok(())
@@ -2000,11 +2011,15 @@ mod tests {
 		let ready = || Status::Ready {
 			privacy_code: String::new(),
 		};
-		let publish = |speakers: &mut SpeakerPublisher, millis| {
+		let publish = |speakers: &mut SpeakerPublisher, millis, deafen| {
 			speakers
 				.publish(
 					start + Duration::from_millis(millis),
 					42,
+					crate::ActivityRevision {
+						deafen,
+						microphone: 0,
+					},
 					std::iter::empty(),
 					&emit,
 				)
@@ -2012,26 +2027,33 @@ mod tests {
 		};
 
 		speakers.progress(Status::WaitingForPeer, &emit).unwrap();
-		publish(&mut speakers, 0);
+		publish(&mut speakers, 0, 0);
 		let waiting = samples.borrow_mut().pop().unwrap();
 		assert_eq!(waiting[0], 42);
 
 		speakers.progress(Status::Securing, &emit).unwrap();
 		speakers.progress(ready(), &emit).unwrap();
-		publish(&mut speakers, 20);
+		publish(&mut speakers, 20, 0);
 		assert!(
 			samples.borrow().is_empty(),
 			"readiness must not bypass the rate limit"
 		);
-		publish(&mut speakers, 100);
+		publish(&mut speakers, 100, 0);
 		assert_eq!(samples.borrow_mut().pop(), Some(waiting));
 
 		// A privacy-code update can re-announce Ready without invalidating the sample.
 		speakers.progress(ready(), &emit).unwrap();
-		publish(&mut speakers, 200);
+		publish(&mut speakers, 200, 0);
 		assert!(
 			samples.borrow().is_empty(),
 			"unchanged samples are deduplicated again"
+		);
+
+		publish(&mut speakers, 700, 2);
+		assert_eq!(
+			samples.borrow_mut().pop().unwrap()[0],
+			42,
+			"unchanged IDs still need to confirm the new revision"
 		);
 	}
 
@@ -3379,7 +3401,7 @@ mod tests {
 							if let Some(sender) = waiting_tx.take() { sender.send(()).unwrap(); }
 						}
 						Status::Connecting | Status::Discovering | Status::Securing
-						| Status::TransportReady | Status::Speaking(_) | Status::CameraAvailable(_) => {}
+						| Status::TransportReady | Status::Speaking(..) | Status::CameraAvailable(_) => {}
 						Status::Latency(_) => unreachable!("latency uses its own queue"),
 					},
 					result = &mut captured_rx, if !captured => {

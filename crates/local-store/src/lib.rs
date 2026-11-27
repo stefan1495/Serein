@@ -134,6 +134,8 @@ pub struct AppPreferences {
 	pub voice_overlay_enabled: Option<bool>,
 	pub voice_overlay_position: Option<model::voice_overlay::Position>,
 	pub voice_overlay_appearance: model::voice_overlay::Appearance,
+	pub voice_overlay_roster: model::voice_overlay::RosterMode,
+	pub overlay_notifications: model::voice_overlay::NotificationSettings,
 	pub input_percent: u16,
 	pub output_percent: u16,
 	/// Which GPU renders the window; applied on the next start.
@@ -202,6 +204,8 @@ impl Default for AppPreferences {
 			voice_overlay_enabled: None,
 			voice_overlay_position: None,
 			voice_overlay_appearance: Default::default(),
+			voice_overlay_roster: Default::default(),
+			overlay_notifications: Default::default(),
 			input_percent: 100,
 			output_percent: 100,
 			gpu_preference: Default::default(),
@@ -241,6 +245,10 @@ impl AppPreferences {
 			}) && self
 			.voice_overlay_position
 			.is_none_or(model::voice_overlay::Position::is_valid)
+			&& self
+				.overlay_notifications
+				.position
+				.is_none_or(model::voice_overlay::Position::is_valid)
 			&& self.voice_overlay_appearance.is_valid()
 			&& self.input_percent <= 200
 			&& self.output_percent <= 200
@@ -2346,6 +2354,29 @@ mod tests {
 		assert!(legacy_overlay.voice_overlay_enabled());
 		assert!(legacy_overlay.voice_overlay_position.is_none());
 		assert_eq!(
+			legacy_overlay.voice_overlay_roster,
+			model::voice_overlay::RosterMode::SpeakingOnly
+		);
+		assert!(
+			!legacy_overlay.overlay_notifications.enabled
+				&& !legacy_overlay.overlay_notifications.include_excerpts
+		);
+		let legacy_notification: AppPreferences = serde_json::from_str(
+			r#"{"overlay_notifications":{"enabled":true,"corner":"bottom_left"}}"#,
+		)
+		.unwrap();
+		assert_eq!(legacy_notification.overlay_notifications.position, None);
+		assert_eq!(
+			legacy_notification.overlay_notifications.corner,
+			model::voice_overlay::ToastCorner::BottomLeft
+		);
+		assert!(
+			serde_json::from_str::<AppPreferences>(
+				r#"{"overlay_notifications":{"corner":"unknown"}}"#
+			)
+			.is_err()
+		);
+		assert_eq!(
 			legacy_overlay.voice_overlay_appearance,
 			model::voice_overlay::Appearance::default()
 		);
@@ -2435,6 +2466,13 @@ mod tests {
 			voice_overlay_monitor: Some("DP-2".into()),
 			voice_overlay_enabled: Some(false),
 			voice_overlay_position: Some(model::voice_overlay::Position { x: 3500, y: 10_000 }),
+			voice_overlay_roster: model::voice_overlay::RosterMode::Everyone,
+			overlay_notifications: model::voice_overlay::NotificationSettings {
+				enabled: true,
+				include_excerpts: true,
+				corner: model::voice_overlay::ToastCorner::BottomRight,
+				position: Some(model::voice_overlay::Position { x: 8100, y: 2500 }),
+			},
 			voice_overlay_appearance: model::voice_overlay::Appearance {
 				show_avatars: false,
 				font_family: Some("Synthetic Sans".into()),
@@ -2453,6 +2491,19 @@ mod tests {
 		value.voice_overlay_position.as_mut().unwrap().x = 10_001;
 		assert!(store.save_app_preferences(&value).is_err());
 		value.voice_overlay_position.as_mut().unwrap().x = 3500;
+		value.overlay_notifications.position.as_mut().unwrap().y = 10_001;
+		assert!(store.save_app_preferences(&value).is_err());
+		assert_eq!(
+			store
+				.app_preferences()
+				.unwrap()
+				.overlay_notifications
+				.position
+				.unwrap()
+				.y,
+			2500
+		);
+		value.overlay_notifications.position.as_mut().unwrap().y = 2500;
 		value.voice_overlay_appearance.font_family = Some("Invalid\nFamily".into());
 		assert!(store.save_app_preferences(&value).is_err());
 		value.voice_overlay_appearance.font_family = Some("Synthetic Sans".into());

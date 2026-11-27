@@ -628,6 +628,9 @@ fn main() -> eframe::Result {
 		persistence_path: None,
 		..Default::default()
 	};
+	// Winit consumes WAYLAND_SOCKET; a separate client could connect to a different compositor.
+	#[cfg(target_os = "linux")]
+	let standalone_wayland_allowed = std::env::var_os("WAYLAND_SOCKET").is_none();
 	let result = eframe::run_native(
 		"Serein",
 		options,
@@ -639,6 +642,8 @@ fn main() -> eframe::Result {
 				transparency_available,
 				preferences,
 				store,
+				#[cfg(target_os = "linux")]
+				standalone_wayland_allowed,
 			)?;
 			let wake = cc.egui_ctx.clone();
 			instance.listen(
@@ -1723,6 +1728,7 @@ impl Desktop {
 		transparency_available: bool,
 		preferences: Result<local_store::AppPreferences, local_store::StoreError>,
 		local_store: Option<local_store::LocalStore>,
+		#[cfg(target_os = "linux")] standalone_wayland_allowed: bool,
 	) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
 		ui::fonts::install(&cc.egui_ctx);
 		ui::emoji::install(&cc.egui_ctx)?;
@@ -2646,7 +2652,8 @@ impl Desktop {
 			.map(|menu| (menu, ui::i18n::Language::System))
 		};
 		#[cfg(target_os = "linux")]
-		let voice_overlay = speaker_overlay::Overlay::new(&cc.egui_ctx, &window);
+		let voice_overlay =
+			speaker_overlay::Overlay::new(&cc.egui_ctx, &window, standalone_wayland_allowed);
 		Ok(Self {
 			proxy_auth: proxy_auth::Authentication::default(),
 			api_proxy: tokio::sync::watch::channel(None).0,
@@ -3064,9 +3071,30 @@ impl Desktop {
 		}
 		self.app_settings.observe(&self.messaging);
 		#[cfg(target_os = "linux")]
-		if self.messaging.voice_overlay.take_retry_request() {
-			self.app_settings
-				.retry_overlay_save(&self.messaging.voice_overlay, self.cache.is_some());
+		{
+			use app_settings::OverlaySection;
+			for (requested, section) in [
+				(
+					self.messaging.voice_overlay.take_layout_retry_request(),
+					OverlaySection::Layout,
+				),
+				(
+					self.messaging.voice_overlay.take_retry_request(),
+					OverlaySection::Voice,
+				),
+				(
+					self.messaging.overlay_notifications.take_retry_request(),
+					OverlaySection::Notifications,
+				),
+			] {
+				if requested {
+					self.app_settings.retry_overlay_save(
+						&self.messaging,
+						section,
+						self.cache.is_some(),
+					);
+				}
+			}
 		}
 		self.cache_pending += usize::from(
 			self.app_settings
@@ -3818,6 +3846,18 @@ impl Desktop {
 	}
 	/// Dispatches one queued command to the demo or live transport.
 	fn command(&mut self, command: Command) {
+		// UI commands can contain both deafen edges before the next media poll.
+		#[cfg(target_os = "linux")]
+		if let Command::Voice(client_core::voice::Command::SetMute {
+			channel,
+			request,
+			deaf,
+			..
+		}) = &command
+		{
+			self.voice
+				.observe_overlay_deafen(&self.state, Some((*channel, *request, *deaf)));
+		}
 		// The offline preview has no one to tell.
 		if matches!(command, Command::Typing { .. }) && (self.state.demo || self.fixture_only) {
 			return;
@@ -5457,6 +5497,13 @@ impl Desktop {
 				}
 			}
 		}
+		#[cfg(target_os = "linux")]
+		{
+			let settings = self.messaging.overlay_notifications.saved;
+			self.state.set_notification_excerpts(
+				!self.fixture_only && settings.enabled && settings.include_excerpts,
+			);
+		}
 		let mut events = Vec::new();
 		let mut terminal = None;
 		let mut expiry = None;
@@ -5609,6 +5656,8 @@ impl Desktop {
 						})
 				)) {
 				self.notifications.dismiss();
+				#[cfg(target_os = "linux")]
+				self.voice_overlay.dismiss_notifications();
 			}
 			let data_changes = extension_data_events::Changes::capture(&self.state, &event);
 			let extension_events = if self.extensions.has_message_events(&self.state) {
@@ -5626,6 +5675,8 @@ impl Desktop {
 			}
 			log_session_event(&event.event);
 			self.state.apply(event);
+			#[cfg(target_os = "linux")]
+			self.voice.observe_overlay_deafen(&self.state, None);
 			if let Some(message) = takeover_notice {
 				self.messaging
 					.toasts
@@ -6503,31 +6554,6 @@ impl eframe::App for Desktop {
 				self.command(command);
 			}
 		}
-		if let Some(alert) = self.notification_runtime.poll(
-			&mut self.state,
-			&mut self.messaging,
-			&self.window,
-			ctx,
-			self.fixture_only,
-		) {
-			match alert {
-				notification_runtime::Alert::Message {
-					channel,
-					title,
-					body,
-					avatar_key,
-					image_path,
-				} => {
-					if self
-						.notifications
-						.notify_channel(channel, title, body, image_path)
-						&& let Some(worker) = &self.avatars
-					{
-						worker.request(avatar_key);
-					}
-				}
-			}
-		}
 		let talking = self.messaging.voice_push_to_talk && self.state.voice.active.is_some();
 		let held =
 			talking && (self.messaging.push_to_talk_down(ctx) || self.hotkeys.push_to_talk_down());
@@ -6574,6 +6600,86 @@ impl eframe::App for Desktop {
 			_ => self.ptt_release = None,
 		}
 		self.messaging.voice_ptt_active = held || lingering;
+
+		self.messaging.voice_ptm_active = self.state.voice.active.is_some()
+			&& (self.messaging.push_to_mute_down(ctx) || self.hotkeys.push_to_mute_down());
+		if self.state.auth == AuthState::Authenticated || self.state.demo {
+			self.poll_voice(ctx);
+		} else {
+			self.voice.stop();
+		}
+		#[cfg(target_os = "linux")]
+		let (overlay_frame, game) = {
+			self.voice_overlay
+				.receive(&mut self.messaging, !hidden_or_closing && !minimized);
+			let game = self.voice_overlay.game_gate(
+				self.messaging.overlay_notifications.saved.enabled
+					&& !self.fixture_only
+					&& !self.state.demo
+					&& self.state.auth == AuthState::Authenticated,
+				self.registered_games.games(),
+				&self.runtime,
+				ctx,
+				now,
+			);
+			let frame = self.voice_overlay.prepare_roster(
+				&self.state,
+				&mut self.messaging,
+				&self.voice,
+				self.avatars.as_ref(),
+			);
+			let gate = (
+				notification_runtime::window_focused(ctx),
+				self.fixture_only,
+				game,
+			);
+			if let Some(alert) =
+				self.voice_overlay
+					.take_geometry_fallback(&self.state, &self.messaging, gate, now)
+			{
+				alert.show(&self.state, &self.notifications, self.avatars.as_ref());
+			}
+			self.voice_overlay
+				.refresh_toast(&self.state, &self.messaging, &frame, gate, now);
+			(frame, game)
+		};
+		self.notification_runtime.poll(
+			&mut self.state,
+			&mut self.messaging,
+			&self.window,
+			ctx,
+			self.fixture_only,
+			|state, ui, notification, now| {
+				notification_runtime::route_visual(
+					notification,
+					ui.notifications_enabled,
+					|candidate| {
+						#[cfg(target_os = "linux")]
+						{
+							self.voice_overlay.admit_notification(
+								state,
+								ui,
+								&overlay_frame,
+								candidate,
+								(game, now),
+							)
+						}
+						#[cfg(not(target_os = "linux"))]
+						{
+							let _ = (candidate, now);
+							false
+						}
+					},
+					|candidate| {
+						notification_runtime::DesktopAlert::from(candidate.notification).show(
+							state,
+							&self.notifications,
+							self.avatars.as_ref(),
+						);
+					},
+				)
+			},
+		);
 		self.notification_runtime.ptt(
 			self.messaging.voice_push_to_talk,
 			!self.fixture_only
@@ -6589,24 +6695,8 @@ impl eframe::App for Desktop {
 			self.messaging.notification_options,
 			ctx,
 		);
-		self.messaging.voice_ptm_active = self.state.voice.active.is_some()
-			&& (self.messaging.push_to_mute_down(ctx) || self.hotkeys.push_to_mute_down());
-		if self.state.auth == AuthState::Authenticated || self.state.demo {
-			self.poll_voice(ctx);
-		} else {
-			self.voice.stop();
-		}
 		#[cfg(target_os = "linux")]
-		{
-			self.voice_overlay
-				.receive(&mut self.messaging, self.state.user.is_some());
-			self.voice_overlay.publish(
-				&self.state,
-				&mut self.messaging,
-				&self.voice,
-				self.avatars.as_ref(),
-			);
-		}
+		self.voice_overlay.publish(overlay_frame, ctx);
 		self.sync_tray(ctx);
 		if self.state.voice.active.is_some() {
 			// Speaking, notices, remote video, devices, hotkeys and deadlines each wake the UI
@@ -7584,29 +7674,6 @@ impl eframe::App for Desktop {
 			frame.set_traffic_lights_position(&ctx, egui::Rangef::new(0.0, title_bar_height), 12.0);
 		}
 		self.sync_customization(&ctx);
-		#[cfg(target_os = "linux")]
-		if self
-			.voice_overlay
-			.receive(&mut self.messaging, self.state.user.is_some())
-		{
-			ctx.request_repaint();
-		}
-		self.save_app_preferences();
-		self.messaging.updates_save_failed = self.app_settings.state.failed;
-		#[cfg(target_os = "linux")]
-		{
-			let overlay = &mut self.messaging.voice_overlay;
-			let persistence = if self.fixture_only || self.state.demo {
-				ui::voice_overlay::Persistence::Idle
-			} else {
-				self.app_settings
-					.overlay_persistence(overlay, self.cache.is_some())
-			};
-			if overlay.persistence != persistence {
-				overlay.persistence = persistence;
-				ctx.request_repaint();
-			}
-		}
 		self.save_reading_preferences(&ctx);
 		self.sync_own_presence(&ctx);
 		self.sync_game_activity(&ctx);
@@ -7777,6 +7844,55 @@ impl eframe::App for Desktop {
 			&ctx,
 			cfg!(target_os = "windows") || self.messaging.uses_custom_title_bar(),
 		);
+		#[cfg(target_os = "linux")]
+		{
+			// Cancel and navigation take precedence over a native approval from this frame.
+			let settings_visible = self.login.is_none()
+				&& self.state.user.is_some()
+				&& !close_requested
+				&& !self.close_approved
+				&& !self.tray_window.hidden
+				&& !self.tray_window.tray_minimized
+				&& !self.tray_window.system_close()
+				&& ctx.input(|input| input.viewport().minimized != Some(true));
+			if self
+				.voice_overlay
+				.finish_frame(&mut self.messaging, settings_visible)
+			{
+				ctx.request_repaint();
+			}
+		}
+		self.save_app_preferences();
+		self.messaging.updates_save_failed = self.app_settings.state.failed;
+		#[cfg(target_os = "linux")]
+		{
+			use app_settings::OverlaySection;
+			let persistence = |section| {
+				if self.fixture_only || self.state.demo {
+					ui::voice_overlay::Persistence::Idle
+				} else {
+					self.app_settings.overlay_persistence(
+						&self.messaging,
+						section,
+						self.cache.is_some(),
+					)
+				}
+			};
+			let layout = persistence(OverlaySection::Layout);
+			let voice = persistence(OverlaySection::Voice);
+			let notifications = persistence(OverlaySection::Notifications);
+			if (
+				self.messaging.voice_overlay.layout_persistence,
+				self.messaging.voice_overlay.persistence,
+				self.messaging.overlay_notifications.persistence,
+			) != (layout, voice, notifications)
+			{
+				self.messaging.voice_overlay.layout_persistence = layout;
+				self.messaging.voice_overlay.persistence = voice;
+				self.messaging.overlay_notifications.persistence = notifications;
+				ctx.request_repaint();
+			}
+		}
 		#[cfg(target_os = "linux")]
 		self.round_window_corners(&ctx, frame);
 		self.frame_metrics.reflows = self.messaging.timeline_reflows();

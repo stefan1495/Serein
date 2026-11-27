@@ -137,6 +137,8 @@ mod thumbhash;
 #[cfg(feature = "demo")]
 pub use polls::debug_poll_check;
 mod moderation;
+#[cfg(target_os = "linux")]
+pub mod overlay_notifications;
 mod timeline;
 #[cfg(test)]
 mod title_bar_tests;
@@ -602,6 +604,8 @@ pub struct MessagingUi {
 	/// Latest media activity, capped at 64 IDs (512 bytes) by the voice host.
 	pub voice_speaking: Vec<Id>,
 	pub voice_overlay: voice_overlay::Settings,
+	#[cfg(target_os = "linux")]
+	pub overlay_notifications: overlay_notifications::Settings,
 	pub notifications_enabled: bool,
 	/// Show as Idle after the account's idle timeout of system inactivity, or on lock.
 	pub auto_idle: bool,
